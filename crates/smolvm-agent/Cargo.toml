@@ -14,6 +14,7 @@ path = "src/main.rs"
 smolvm-protocol = { path = "../smolvm-protocol", version = "1.6.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tracing = { workspace = true }
 lazy_static = "1.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

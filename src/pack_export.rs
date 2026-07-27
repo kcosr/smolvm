@@ -79,6 +79,16 @@ pub fn collect_from_vm_assets(
     }
 
     let vm_dir = vm_data_dir(vm_name);
+    let _source_lock = SourceVmLock::acquire(&vm_dir, vm_name)?;
+    if source_vm_process_is_alive(&vm_dir) {
+        return Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' is running. Stop it first with: \
+                 smolvm machine stop --name {vm_name}"
+            ),
+        ));
+    }
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
     let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
@@ -93,24 +103,40 @@ pub fn collect_from_vm_assets(
         ));
     }
 
-    if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
-    } else if is_image_based {
+    if is_image_based {
         let image = vm.image.clone().unwrap();
-        if image.starts_with("local:") {
-            export_flattened_from_local_archive(collector, vm_name, &vm_dir, &image)?;
-        } else if crate::data::image_source::is_local_ref(&image) {
-            return Err(Error::agent(
-                "pack from VM",
-                format!(
-                    "VM '{vm_name}' was created from a local image ({image}). \
-                     `pack create --from-vm` cannot snapshot machines created from \
-                     rootfs directories. Recreate the machine from an image archive, \
-                     registry reference, or .smolmachine artifact to pack it."
-                ),
-            ));
-        } else {
-            export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
+        match image_export_source(&image, is_artifact_sourced, opts.rebase_from_image) {
+            ImageExportSource::Artifact => {
+                export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
+            }
+            ImageExportSource::LocalArchive => {
+                export_flattened_from_local_archive(collector, vm_name, &vm_dir, &image)?;
+            }
+            ImageExportSource::LocalDirectory => {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "VM '{vm_name}' was created from a local image ({image}). \
+                         `pack create --from-vm` cannot snapshot machines created from \
+                         rootfs directories. Recreate the machine from an image archive, \
+                         registry reference, or .smolmachine artifact to pack it."
+                    ),
+                ));
+            }
+            ImageExportSource::UnsupportedLocalRebase => {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "VM '{vm_name}' came from a .smolmachine whose recorded image is \
+                         local ({image}); `--rebase-from-image` cannot recover that original \
+                         host archive. Export without `--rebase-from-image` to preserve the \
+                         artifact's imported layers."
+                    ),
+                ));
+            }
+            ImageExportSource::Registry => {
+                export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
+            }
         }
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
@@ -140,6 +166,37 @@ pub fn collect_from_vm_assets(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageExportSource {
+    Artifact,
+    LocalArchive,
+    LocalDirectory,
+    UnsupportedLocalRebase,
+    Registry,
+}
+
+fn image_export_source(
+    image: &str,
+    is_artifact_sourced: bool,
+    rebase_from_image: bool,
+) -> ImageExportSource {
+    if is_artifact_sourced && !rebase_from_image {
+        return ImageExportSource::Artifact;
+    }
+    if image.starts_with("local:") {
+        return if is_artifact_sourced {
+            ImageExportSource::UnsupportedLocalRebase
+        } else {
+            ImageExportSource::LocalArchive
+        };
+    }
+    if crate::data::image_source::is_local_ref(image) {
+        ImageExportSource::LocalDirectory
+    } else {
+        ImageExportSource::Registry
+    }
+}
+
 /// Seed a pack manifest with the source machine's runtime identity. CLI /
 /// Smolfile overrides layer on top of this baseline at the call site.
 pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets: &FromVmAssets) {
@@ -166,6 +223,64 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
 struct ExportVm {
     manager: AgentManager,
     data_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct SourceVmLock {
+    _file: std::fs::File,
+}
+
+impl SourceVmLock {
+    fn acquire(vm_dir: &Path, vm_name: &str) -> crate::Result<Self> {
+        std::fs::create_dir_all(vm_dir)
+            .map_err(|error| Error::agent("prepare source VM lock", error.to_string()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(vm_dir.join("vm.lock"))
+            .map_err(|error| Error::agent("lock source VM", error.to_string()))?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::WouldBlock {
+                format!(
+                    "machine '{vm_name}' is starting, running, or already being exported; \
+                     stop it and retry"
+                )
+            } else {
+                error.to_string()
+            };
+            Error::agent("lock source VM", message)
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn source_vm_process_is_alive(vm_dir: &Path) -> bool {
+    let content = match std::fs::read_to_string(vm_dir.join("agent.pid")) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+    let Some((pid, start_time)) = parse_pid_identity(&content) else {
+        return false;
+    };
+    if let Some(start_time) = start_time {
+        crate::process::is_our_process_strict(pid, Some(start_time))
+    } else {
+        crate::process::is_alive(pid)
+            && crate::process::cmdline_contains(
+                pid,
+                &vm_dir.join("boot-config.json").to_string_lossy(),
+            )
+    }
+}
+
+fn parse_pid_identity(content: &str) -> Option<(i32, Option<u64>)> {
+    let mut lines = content.lines();
+    let pid = lines.next()?.trim().parse::<i32>().ok()?;
+    let start_time = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u64>().ok());
+    Some((pid, start_time))
 }
 
 impl ExportVm {
@@ -206,6 +321,9 @@ impl ExportVm {
         println!("Starting agent VM to export machine state...");
         let manager = AgentManager::for_vm(&scratch_name)?;
         let features = LaunchFeatures {
+            // Attach writable so ext4 can replay a pending journal. The
+            // filesystem itself is mounted read-only below, and SourceVmLock
+            // excludes a concurrent machine start.
             extra_disks: vec![(storage_disk, false, storage_fmt)],
             packed_layers_dir,
             // Under per-VM uid isolation the source VM's dir is 0700/its-own-uid;
@@ -252,7 +370,9 @@ impl ExportVm {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage".to_string(),
+                "mkdir -p /mnt/source-storage && \
+                 mount -o ro /dev/vdc /mnt/source-storage"
+                    .to_string(),
             ],
             vec![],
             None,
@@ -290,21 +410,30 @@ fn export_flattened_from_local_archive(
     vm_dir: &Path,
     image: &str,
 ) -> crate::Result<()> {
-    let hash = image.strip_prefix("local:").unwrap_or_default();
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(Error::agent(
+    let hash = local_archive_hash(image).ok_or_else(|| {
+        Error::agent(
             "pack from VM",
             format!("VM '{vm_name}' has an invalid local image reference: {image}"),
-        ));
-    }
+        )
+    })?;
 
     let export_vm = ExportVm::start(vm_name, vm_dir, None, false)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    let lower = "/mnt/source-storage/image-archives/packed_layers/0000_rootfs".to_string();
+    let archive_dir = "/mnt/source-storage/image-archives/packed_layers";
+    let lower = format!("{archive_dir}/0000_rootfs");
+    let marker = format!("{archive_dir}/.extracted");
+    let expected_marker = format!("sha256={hash}");
     let (exit_code, _, _) = client.vm_exec(
-        vec!["test".to_string(), "-d".to_string(), lower.clone()],
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "test -d '{lower}' && test ! -L '{lower}' && \
+                 test -f '{marker}' && grep -Fqx '{expected_marker}' '{marker}'"
+            ),
+        ],
         vec![],
         None,
         None,
@@ -314,13 +443,23 @@ fn export_flattened_from_local_archive(
         return Err(Error::agent(
             "pack from VM",
             format!(
-                "VM '{vm_name}' is missing its flattened local-image rootfs at {lower}. \
-                 Start the machine once to reconstruct it, then retry the export."
+                "VM '{vm_name}' is missing a completed flattened rootfs for {image}. \
+                 Run `smolvm machine exec --name {vm_name} -- true` to reconstruct it, \
+                 then retry the export."
             ),
         ));
     }
 
     flatten_and_export(collector, &mut client, vm_name, &[lower])
+}
+
+fn local_archive_hash(image: &str) -> Option<&str> {
+    image.strip_prefix("local:").filter(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Registry-image machine: pull the base image inside the helper VM (layers
@@ -671,4 +810,68 @@ fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
         ));
     }
     Ok(u64::from_be_bytes(header[24..32].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn validates_canonical_local_archive_references() {
+        assert_eq!(local_archive_hash(&format!("local:{HASH}")), Some(HASH));
+        for invalid in [
+            "local:",
+            "local:../archive",
+            "local:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "local:0123",
+            "registry.example/image:tag",
+        ] {
+            assert_eq!(local_archive_hash(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn classifies_image_export_sources_and_local_rebase() {
+        assert_eq!(
+            image_export_source(&format!("local:{HASH}"), false, false),
+            ImageExportSource::LocalArchive
+        );
+        assert_eq!(
+            image_export_source("local-dir:/tmp/rootfs", false, false),
+            ImageExportSource::LocalDirectory
+        );
+        assert_eq!(
+            image_export_source("alpine:latest", false, false),
+            ImageExportSource::Registry
+        );
+        assert_eq!(
+            image_export_source("alpine:latest", true, false),
+            ImageExportSource::Artifact
+        );
+        assert_eq!(
+            image_export_source(&format!("local:{HASH}"), true, true),
+            ImageExportSource::UnsupportedLocalRebase
+        );
+    }
+
+    #[test]
+    fn source_vm_lock_excludes_a_second_export_or_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let vm_dir = directory.path().join("not-created-yet");
+        let first = SourceVmLock::acquire(&vm_dir, "test-vm").unwrap();
+        let error = SourceVmLock::acquire(&vm_dir, "test-vm").unwrap_err();
+        assert!(error.to_string().contains("already being exported"));
+        drop(first);
+        SourceVmLock::acquire(&vm_dir, "test-vm").unwrap();
+    }
+
+    #[test]
+    fn parses_current_and_legacy_pid_files() {
+        assert_eq!(parse_pid_identity("123\n456\n"), Some((123, Some(456))));
+        assert_eq!(parse_pid_identity("123"), Some((123, None)));
+        assert_eq!(parse_pid_identity("not-a-pid\n456"), None);
+        assert_eq!(parse_pid_identity(""), None);
+    }
 }

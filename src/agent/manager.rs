@@ -161,7 +161,6 @@ struct AgentInner {
     /// Held while the VM is running. Released on stop/Drop to allow other
     /// processes to start the VM. The kernel releases the lock automatically
     /// if the process crashes.
-    #[cfg(unix)]
     vm_lock_handle: Option<std::fs::File>,
 }
 
@@ -495,10 +494,9 @@ pub struct AgentManager {
     startup_error_log: PathBuf,
     /// Per-VM lock file for cross-process coordination.
     ///
-    /// Acquired with flock(LOCK_EX) before spawn and held through PID file
+    /// Acquired exclusively before spawn and held through PID file
     /// write. Prevents two processes from starting the same VM simultaneously.
     /// The kernel releases the lock on process exit (crash-safe).
-    #[cfg(unix)]
     vm_lock: PathBuf,
     /// Internal state.
     inner: Arc<Mutex<AgentInner>>,
@@ -574,7 +572,6 @@ impl AgentManager {
         let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
         let startup_error_log: PathBuf = smolvm_runtime.join("agent-startup-error.log");
-        #[cfg(unix)]
         let vm_lock = smolvm_runtime.join("vm.lock");
 
         Ok(Self {
@@ -587,7 +584,6 @@ impl AgentManager {
             config_file,
             console_log,
             startup_error_log,
-            #[cfg(unix)]
             vm_lock,
             inner: Arc::new(Mutex::new(AgentInner {
                 state: AgentState::Stopped,
@@ -598,7 +594,6 @@ impl AgentManager {
                 config_state: ConfigState::Unknown,
                 detached: false,
                 is_clone: false,
-                #[cfg(unix)]
                 vm_lock_handle: None,
             })),
         })
@@ -842,10 +837,7 @@ impl AgentManager {
             tracing::info!("resetting stale Running state to Stopped (VM process is dead)");
             inner.state = AgentState::Stopped;
             inner.child = None;
-            #[cfg(unix)]
-            {
-                inner.vm_lock_handle = None;
-            }
+            inner.vm_lock_handle = None;
         }
     }
 
@@ -853,7 +845,7 @@ impl AgentManager {
     /// after the VM process has already been stopped out-of-band (the HTTP stop
     /// path kills the recorded PID directly rather than via this manager).
     ///
-    /// The serve process holds the `vm.lock` flock for the lifetime of the
+    /// The serve process holds the exclusive `vm.lock` for the lifetime of the
     /// registry's `AgentManager`; if `vm_lock_handle` is not dropped here, the
     /// serve process keeps holding the lock and a subsequent start fails to
     /// re-acquire it ("another process is already starting or running this VM").
@@ -862,10 +854,7 @@ impl AgentManager {
         let mut inner = self.inner.lock();
         inner.state = AgentState::Stopped;
         inner.child = None;
-        #[cfg(unix)]
-        {
-            inner.vm_lock_handle = None;
-        }
+        inner.vm_lock_handle = None;
     }
 
     /// Return consistent (state, pid) for API status responses.
@@ -1401,19 +1390,15 @@ impl AgentManager {
         // concurrent start attempts across OS processes. The lock is held
         // until stop/Drop releases it. If another process already holds the
         // lock (VM is running), we block briefly then re-check state.
-        #[cfg(unix)]
         let lock_handle = {
-            use std::os::unix::io::AsRawFd;
             let lock_file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(false)
                 .open(&self.vm_lock)
                 .map_err(|e| Error::agent("acquire VM lock", e.to_string()))?;
-            let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            if let Err(err) = fs2::FileExt::try_lock_exclusive(&lock_file) {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
                     return Err(Error::agent(
                         "start agent",
                         "another process is already starting or running this VM",
@@ -1438,10 +1423,7 @@ impl AgentManager {
             inner.ports = ports.to_vec();
             inner.resources = resources;
             inner.config_state = ConfigState::Known;
-            #[cfg(unix)]
-            {
-                inner.vm_lock_handle = Some(lock_handle);
-            }
+            inner.vm_lock_handle = Some(lock_handle);
         }
 
         tracing::info!(
@@ -1575,10 +1557,7 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;
-                #[cfg(unix)]
-                {
-                    inner.vm_lock_handle = None;
-                }
+                inner.vm_lock_handle = None;
                 Err(e)
             }
         }
@@ -2357,10 +2336,7 @@ impl AgentManager {
             inner.state = AgentState::Stopped;
             inner.child = None;
             // Release the per-VM file lock so other processes can start this VM.
-            #[cfg(unix)]
-            {
-                inner.vm_lock_handle = None;
-            }
+            inner.vm_lock_handle = None;
         }
 
         self.cleanup_marker_files();

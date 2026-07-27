@@ -12,6 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
+use sha2::{Digest as _, Sha256};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -598,11 +599,24 @@ const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 /// still matches, so a machine re-created from a different image on a reused
 /// disk re-flattens instead of booting the old rootfs. The marker is written
 /// last, so the image-info and overlay paths share one flatten within a start.
-fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
+fn ensure_archive_flattened(packed_dir: &Path, image: &str) -> Result<Option<PathBuf>> {
     let archive = packed_dir.join(ARCHIVE_FILE_NAME);
     if !archive.exists() {
         return Ok(None);
     }
+    let expected_hash = image
+        .strip_prefix("local:")
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            StorageError::new(format!(
+                "local image archive has invalid persisted reference: {image}"
+            ))
+        })?;
     let key = packed_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -610,7 +624,8 @@ fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
     let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
     let signature = archive_signature(&archive)?;
-    if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
+    let expected_marker = archive_marker(&signature, expected_hash);
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(expected_marker.as_str()) {
         return Ok(Some(out_base));
     }
 
@@ -619,13 +634,37 @@ fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
     let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
+    let actual_hash = hash_archive(&archive)?;
+    if actual_hash != expected_hash {
+        return Err(StorageError::new(format!(
+            "local image archive digest mismatch: expected {expected_hash}, got {actual_hash}"
+        )));
+    }
     flatten_archive(&archive, &rootfs)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
     recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
-    std::fs::write(&marker, signature)?;
+    std::fs::write(&marker, expected_marker)?;
     Ok(Some(out_base))
+}
+
+fn archive_marker(signature: &str, hash: &str) -> String {
+    format!("signature={signature}\nsha256={hash}\n")
+}
+
+fn hash_archive(archive: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(archive)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let bytes = std::io::Read::read(&mut file, &mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        digest.update(&buffer[..bytes]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// A cheap content signature for a staged archive (size + mtime), used to
@@ -1645,7 +1684,7 @@ where
         info!(image = %image, "using packed layers, skipping network pull");
         // A local image archive is flattened into a rootfs first; an ordinary
         // packed-layers dir is used as-is.
-        if let Some(flattened) = ensure_archive_flattened(packed_dir)? {
+        if let Some(flattened) = ensure_archive_flattened(packed_dir, image)? {
             return create_packed_image_info(image, &flattened);
         }
         return create_packed_image_info(image, packed_dir);
@@ -1953,7 +1992,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // synthesize image info without a registry manifest, mirroring the pull
     // path. A local image archive is flattened into a rootfs first.
     if let Some(packed_dir) = get_packed_layers_dir() {
-        let flattened = ensure_archive_flattened(packed_dir)?;
+        let flattened = ensure_archive_flattened(packed_dir, image)?;
         let effective = flattened.as_deref().unwrap_or(packed_dir);
         return Ok(Some(create_packed_image_info(image, effective)?));
     }
@@ -2504,7 +2543,7 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
         // A local image archive is flattened into a rootfs (a single packed
         // layer) first; an ordinary packed-layers dir is used as-is.
-        let flattened = ensure_archive_flattened(packed_dir)?;
+        let flattened = ensure_archive_flattened(packed_dir, image)?;
         let effective = flattened.as_deref().unwrap_or(packed_dir);
         return prepare_overlay_from_packed(image, workload_id, effective);
     }
@@ -2938,7 +2977,7 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is.
     let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
-        let flattened = ensure_archive_flattened(packed_dir)?;
+        let flattened = ensure_archive_flattened(packed_dir, image)?;
         let effective = flattened.as_deref().unwrap_or(packed_dir);
         get_packed_lowerdirs(effective)?
     } else {
@@ -3938,6 +3977,25 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn local_archive_marker_binds_signature_and_digest() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            archive_marker("123:456", hash),
+            format!("signature=123:456\nsha256={hash}\n")
+        );
+    }
+
+    #[test]
+    fn hashes_local_archive_content() {
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(archive.path(), b"abc").unwrap();
+        assert_eq!(
+            hash_archive(archive.path()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
