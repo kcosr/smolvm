@@ -19,6 +19,7 @@ pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
 pub const DEFAULT_GPU_VRAM_MIB: u32 = 4096;
 
 use crate::network::NetworkBackend;
+use smolvm_network::TcpEgressConfig;
 
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +56,9 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Optional destination-port routing for virtio-net TCP egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_egress: Option<TcpEgressConfig>,
     /// Custom DNS resolver for the guest. None = backend default.
     ///
     /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
@@ -113,6 +117,11 @@ impl VmResources {
                 "overlay disk size must be greater than 0 GiB",
             ));
         }
+        if let Some(config) = &self.tcp_egress {
+            config
+                .validate()
+                .map_err(|error| crate::Error::config("validate TCP egress", error.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -131,6 +140,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            tcp_egress: None,
             dns: None,
         }
     }

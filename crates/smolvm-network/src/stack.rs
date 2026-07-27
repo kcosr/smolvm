@@ -56,6 +56,7 @@ use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::egress::EgressPolicy;
 use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
+use crate::tcp_egress::TcpEgressPolicy;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
 use crate::udp_relay;
@@ -152,11 +153,12 @@ enum FrameAction {
 /// - this thread owns all smoltcp state
 /// - relay threads never touch smoltcp sockets directly
 /// - frame bridge threads never parse protocols beyond raw Ethernet framing
-pub fn start_network_stack(
+pub(crate) fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    tcp_egress: TcpEgressPolicy,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -166,7 +168,7 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress))
+        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress, tcp_egress))
 }
 
 fn run_network_stack(
@@ -174,6 +176,7 @@ fn run_network_stack(
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    tcp_egress: TcpEgressPolicy,
 ) {
     // Poll loop overview:
     //
@@ -211,7 +214,7 @@ fn run_network_stack(
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone());
+    let mut relays = TcpRelayTable::with_tcp_egress(None, egress.clone(), tcp_egress);
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();

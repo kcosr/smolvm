@@ -434,6 +434,7 @@ pub struct CreateVmParams {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub tcp_egress: Option<smolvm_network::TcpEgressConfig>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
     pub restart_max_backoff_secs: Option<u64>,
@@ -622,6 +623,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.tcp_egress = params.tcp_egress.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.gpu = if params.gpu { Some(true) } else { None };
@@ -1196,6 +1198,7 @@ pub fn persist_named_running(
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
                 r.allowed_cidrs = o.allowed_cidrs.clone();
+                r.tcp_egress = o.tcp_egress.clone();
                 r.init = o.init.clone();
                 r.init_completed = false;
                 r.env = o.env.clone();
@@ -1236,6 +1239,7 @@ pub struct DefaultVmOverrides {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub tcp_egress: Option<smolvm_network::TcpEgressConfig>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub secret_refs: BTreeMap<String, SecretRef>,

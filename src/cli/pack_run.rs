@@ -413,6 +413,7 @@ impl PackRunCmd {
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: None,
+            tcp_egress: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
 
@@ -1454,6 +1455,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        tcp_egress: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
@@ -1857,6 +1859,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        tcp_egress: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 

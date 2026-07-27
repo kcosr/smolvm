@@ -11,6 +11,7 @@ crossbeam-queue = "0.3"
 humantime = "2"
 libc = "0.2"
 polling = "3"
+serde = { version = "1", features = ["derive"] }
 smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "log",
@@ -28,6 +29,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 socket2 = "0.6"
 tracing = { workspace = true }
+zeroize = "1"
 
 [features]
 # Exposes fuzz-only entrypoints (e.g. fuzz_classify_guest_frame). Never enabled in normal builds.

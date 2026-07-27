@@ -23,6 +23,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +84,46 @@ fn resolve_egress_flags(
     };
 
     Ok((allow_cidr, net, dns_filter_hosts))
+}
+
+fn build_tcp_egress_config(
+    awaf_routes: &[String],
+    direct_ports: &[u16],
+    unmatched: Option<smolvm_network::UnmatchedTcp>,
+) -> smolvm::Result<Option<smolvm_network::TcpEgressConfig>> {
+    if awaf_routes.is_empty() && direct_ports.is_empty() && unmatched.is_none() {
+        return Ok(None);
+    }
+
+    let mut routes = BTreeMap::new();
+    for spec in awaf_routes {
+        let (port, socket) = spec.split_once('=').ok_or_else(|| {
+            smolvm::Error::config("--awaf-route", "expected PORT=/absolute/socket/path")
+        })?;
+        let port = port.parse::<u16>().map_err(|_| {
+            smolvm::Error::config("--awaf-route", format!("invalid TCP port '{port}'"))
+        })?;
+        let socket = PathBuf::from(socket);
+        if routes.insert(port, socket).is_some() {
+            return Err(smolvm::Error::config(
+                "--awaf-route",
+                format!("duplicate AWAF route for TCP port {port}"),
+            ));
+        }
+    }
+
+    let direct_port_count = direct_ports.len();
+    let direct_ports: BTreeSet<u16> = direct_ports.iter().copied().collect();
+    if direct_ports.len() != direct_port_count {
+        return Err(smolvm::Error::config(
+            "--direct-tcp-port",
+            "duplicate direct TCP port",
+        ));
+    }
+
+    smolvm_network::TcpEgressConfig::new(routes, direct_ports, unmatched.unwrap_or_default())
+        .map(Some)
+        .map_err(|error| smolvm::Error::config("TCP egress", error.to_string()))
 }
 
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
@@ -388,7 +429,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file", "awaf_route", "direct_tcp_port", "unmatched_tcp"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -479,6 +520,26 @@ pub struct RunCmd {
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
+
+    /// Route a TCP destination port through an AWAF Unix socket (repeatable).
+    #[arg(
+        long = "awaf-route",
+        value_name = "PORT=/ABSOLUTE/SOCKET",
+        help_heading = "Network"
+    )]
+    pub awaf_route: Vec<String>,
+
+    /// Permit direct host TCP connections to this destination port (repeatable).
+    #[arg(long = "direct-tcp-port", value_parser = clap::value_parser!(u16).range(1..), value_name = "PORT", help_heading = "Network")]
+    pub direct_tcp_port: Vec<u16>,
+
+    /// Handle TCP ports absent from AWAF and direct route lists.
+    #[arg(
+        long = "unmatched-tcp",
+        value_name = "direct|deny",
+        help_heading = "Network"
+    )]
+    pub unmatched_tcp: Option<smolvm_network::UnmatchedTcp>,
 
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long, help_heading = "Resources")]
@@ -919,6 +980,8 @@ impl RunCmd {
             self.outbound_localhost_only,
             self.net,
         )?;
+        let tcp_egress =
+            build_tcp_egress_config(&self.awaf_route, &self.direct_tcp_port, self.unmatched_tcp)?;
 
         let params = crate::cli::smolfile::build_create_params(
             vm_name.clone(),
@@ -942,6 +1005,7 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        params.tcp_egress = tcp_egress;
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -965,6 +1029,13 @@ impl RunCmd {
         // the normal in-guest pull.
         if let Some(img) = params.image.clone() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(&img)? {
+                if params.tcp_egress.is_some() {
+                    return Err(Error::config(
+                        "machine run",
+                        "TCP egress routing is not supported when --image resolves to a \
+                         .smolmachine pack artifact",
+                    ));
+                }
                 if self.detach {
                     // pack-run is ephemeral-only; a persistent machine from a
                     // pack ref goes through create (which reroutes the same way).
@@ -1023,6 +1094,7 @@ impl RunCmd {
         // stages the archive once in this process and runs init inline (#459).
         if !self.no_init_cache
             && !self.detach
+            && params.tcp_egress.is_none()
             && image_bakeable(params.image.as_deref())
             && !params.init.is_empty()
         {
@@ -1157,6 +1229,7 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            tcp_egress: params.tcp_egress.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -1480,6 +1553,7 @@ impl RunCmd {
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
+                                tcp_egress: params.tcp_egress.clone(),
                                 init: params.init.clone(),
                                 // Strip resolved secret values so plaintext never
                                 // reaches the DB/pack record. defaults.env still
@@ -1642,6 +1716,7 @@ impl RunCmd {
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
                             allowed_cidrs: params.allowed_cidrs.clone(),
+                            tcp_egress: params.tcp_egress.clone(),
                             init: params.init.clone(),
                             env: parse_env_list(&params.env),
                             workdir: params.workdir.clone(),
@@ -1838,6 +1913,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builds_tcp_egress_routes_from_cli_values() {
+        let config = build_tcp_egress_config(
+            &[
+                "80=/run/acl/http.sock".to_string(),
+                "443=/run/acl/https.sock".to_string(),
+            ],
+            &[22],
+            Some(smolvm_network::UnmatchedTcp::Deny),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            config.access_flow_routes().get(&80),
+            Some(&PathBuf::from("/run/acl/http.sock"))
+        );
+        assert_eq!(
+            config.access_flow_routes().get(&443),
+            Some(&PathBuf::from("/run/acl/https.sock"))
+        );
+        assert_eq!(config.direct_ports(), &BTreeSet::from([22]));
+        assert_eq!(config.unmatched(), smolvm_network::UnmatchedTcp::Deny);
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_tcp_egress_routes() {
+        assert!(build_tcp_egress_config(&["443=relative.sock".to_string()], &[], None).is_err());
+        assert!(build_tcp_egress_config(
+            &[
+                "443=/run/acl/one.sock".to_string(),
+                "443=/run/acl/two.sock".to_string(),
+            ],
+            &[],
+            None,
+        )
+        .is_err());
+        assert!(
+            build_tcp_egress_config(&["443=/run/acl/https.sock".to_string()], &[443], None,)
+                .is_err()
+        );
+        assert!(build_tcp_egress_config(&[], &[22, 22], None).is_err());
+    }
+
     #[derive(Parser, Debug)]
     #[command(name = "machine")]
     struct TestMachineCli {
@@ -1856,6 +1975,39 @@ mod tests {
         };
         assert_eq!(cmd.name, Some("foo".to_string()));
         assert!(cmd.detach);
+    }
+
+    #[test]
+    fn run_and_create_accept_tcp_egress_flags() {
+        let run = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--awaf-route",
+            "80=/run/acl/http.sock",
+            "--direct-tcp-port",
+            "22",
+            "--unmatched-tcp",
+            "deny",
+        ]);
+        let MachineCmd::Run(run) = run.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(run.awaf_route, ["80=/run/acl/http.sock"]);
+        assert_eq!(run.direct_tcp_port, [22]);
+        assert_eq!(run.unmatched_tcp, Some(smolvm_network::UnmatchedTcp::Deny));
+
+        let create = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "routed",
+            "--awaf-route",
+            "443=/run/acl/https.sock",
+        ]);
+        let MachineCmd::Create(create) = create.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(create.awaf_route, ["443=/run/acl/https.sock"]);
     }
 
     // Documents the clap parsing behaviour: positionals before "--" land in
@@ -2308,6 +2460,18 @@ pub struct CreateCmd {
     #[arg(long)]
     pub outbound_localhost_only: bool,
 
+    /// Route a TCP destination port through an AWAF Unix socket (repeatable).
+    #[arg(long = "awaf-route", value_name = "PORT=/ABSOLUTE/SOCKET")]
+    pub awaf_route: Vec<String>,
+
+    /// Permit direct host TCP connections to this destination port (repeatable).
+    #[arg(long = "direct-tcp-port", value_parser = clap::value_parser!(u16).range(1..), value_name = "PORT")]
+    pub direct_tcp_port: Vec<u16>,
+
+    /// Handle TCP ports absent from AWAF and direct route lists.
+    #[arg(long = "unmatched-tcp", value_name = "direct|deny")]
+    pub unmatched_tcp: Option<smolvm_network::UnmatchedTcp>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long)]
     pub gpu: bool,
@@ -2423,6 +2587,8 @@ impl CreateCmd {
             self.outbound_localhost_only,
             self.net,
         )?;
+        let tcp_egress =
+            build_tcp_egress_config(&self.awaf_route, &self.direct_tcp_port, self.unmatched_tcp)?;
 
         let name = self
             .name
@@ -2464,6 +2630,7 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        params.tcp_egress = tcp_egress;
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -2492,6 +2659,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            tcp_egress: params.tcp_egress.clone(),
         };
         // Reject zero-valued resources before the machine is persisted.
         // Without this, `machine create` succeeds and the failure only
@@ -2661,6 +2829,11 @@ impl CreateCmd {
             storage_gb: self.storage,
             overlay_gb: self.overlay,
             allowed_cidrs: None,
+            tcp_egress: build_tcp_egress_config(
+                &self.awaf_route,
+                &self.direct_tcp_port,
+                self.unmatched_tcp,
+            )?,
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
@@ -2681,6 +2854,9 @@ impl CreateCmd {
         };
 
         let record = vm_common::build_vm_record(&params)?;
+        let resources = record.vm_resources();
+        resources.validate()?;
+        validate_requested_network_backend(&resources, None, record.ports.len())?;
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 
         // Create the machine data dir while the DB reservation is held, then
@@ -3391,6 +3567,10 @@ impl UpdateCmd {
                 if r.dns_filter_hosts.is_some() {
                     changes.push("  cleared dns_filter_hosts".to_string());
                     r.dns_filter_hosts = None;
+                }
+                if r.tcp_egress.is_some() {
+                    changes.push("  cleared TCP egress routing".to_string());
+                    r.tcp_egress = None;
                 }
             }
 

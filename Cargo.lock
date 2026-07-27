@@ -3131,9 +3131,11 @@ dependencies = [
  "humantime",
  "libc",
  "polling",
+ "serde",
  "smoltcp",
  "socket2",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

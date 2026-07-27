@@ -28,6 +28,7 @@
 
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
+use crate::tcp_egress::{AccessFlowProxy, TcpEgressPolicy, TcpRoute};
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -35,6 +36,8 @@ use smoltcp::wire::IpListenEndpoint;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -64,6 +67,8 @@ pub struct TcpRelayTable {
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
     egress: EgressPolicy,
+    /// Host-selected destination-port routing applied after the IP egress policy.
+    tcp_egress: TcpEgressPolicy,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -125,6 +130,8 @@ struct PendingProxyEndpoints {
 pub enum RelayTarget {
     /// Open a new outbound host `TcpStream` to the destination.
     Connect(SocketAddr),
+    /// Open one AWAF connection to the configured Unix socket.
+    AccessFlow(Arc<AccessFlowProxy>),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
 }
@@ -185,6 +192,14 @@ impl RelayExitState {
 impl TcpRelayTable {
     /// Create a new relay table.
     pub fn new(max_connections: Option<usize>, egress: EgressPolicy) -> Self {
+        Self::with_tcp_egress(max_connections, egress, TcpEgressPolicy::direct())
+    }
+
+    pub(crate) fn with_tcp_egress(
+        max_connections: Option<usize>,
+        egress: EgressPolicy,
+        tcp_egress: TcpEgressPolicy,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
@@ -192,6 +207,7 @@ impl TcpRelayTable {
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
             egress,
+            tcp_egress,
         }
     }
 
@@ -238,6 +254,18 @@ impl TcpRelayTable {
             return false;
         }
 
+        let relay_target = match self.tcp_egress.route(destination) {
+            TcpRoute::Direct => RelayTarget::Connect(destination),
+            TcpRoute::AccessFlow(proxy) => RelayTarget::AccessFlow(proxy),
+            TcpRoute::Deny => {
+                tracing::debug!(
+                    %destination,
+                    "virtio-net: blocking outbound TCP connection by port routing policy"
+                );
+                return false;
+            }
+        };
+
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -267,7 +295,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(destination),
+                    relay_target,
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -604,7 +632,7 @@ fn tcp_relay_loop(
 ) -> io::Result<RelayExitMode> {
     // Host-side flow:
     //
-    // 1. Connect a normal host TcpStream to the destination.
+    // 1. Obtain the selected direct, AWAF, or attached host-side stream.
     // 2. Non-blockingly drain guest payloads from the channel into the socket.
     // 3. Non-blockingly read remote payloads from the socket into the channel.
     // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
@@ -619,7 +647,30 @@ fn tcp_relay_loop(
                 "virtio-net: host TCP relay socket connected destination={}",
                 destination
             );
-            stream
+            HostRelayStream::Tcp(stream)
+        }
+        RelayTarget::AccessFlow(proxy) => {
+            virtio_net_log!(
+                "virtio-net: connecting AWAF relay destination={}",
+                destination
+            );
+            #[cfg(unix)]
+            {
+                let stream = proxy.connect(destination)?;
+                virtio_net_log!(
+                    "virtio-net: AWAF relay connected destination={}",
+                    destination
+                );
+                HostRelayStream::Unix(stream)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = proxy;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "AWAF Unix socket egress is unsupported on this host",
+                ));
+            }
         }
         RelayTarget::Attached(stream) => {
             virtio_net_log!(
@@ -628,7 +679,7 @@ fn tcp_relay_loop(
                 stream.peer_addr().ok(),
                 stream.local_addr().ok()
             );
-            stream
+            HostRelayStream::Tcp(stream)
         }
     };
     stream.set_nonblocking(true)?;
@@ -725,6 +776,58 @@ fn tcp_relay_loop(
 
         if !did_work {
             thread::sleep(PROXY_IDLE_SLEEP);
+        }
+    }
+}
+
+enum HostRelayStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl HostRelayStream {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.shutdown(how),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(how),
+        }
+    }
+}
+
+impl Read for HostRelayStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buffer),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for HostRelayStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buffer),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
         }
     }
 }

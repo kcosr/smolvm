@@ -526,6 +526,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let _ = &pod_net;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    #[cfg(target_os = "linux")]
+    if pod_net.is_some() && resources.tcp_egress.is_some() {
+        return Err(Error::config(
+            "TCP egress policy",
+            "host TCP egress routing is unavailable with the pod netns-tap datapath",
+        ));
+    }
 
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
     // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
@@ -989,6 +996,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                resources.tcp_egress.as_ref(),
                             ) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
@@ -1066,6 +1074,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     // blocking krun_start_enter, so accept on a background thread.
                     // The accepted runtime owns its worker threads and parks here
                     // until libkrun closes the stream (VM exit) for a clean teardown.
+                    let tcp_egress = resources.tcp_egress.clone();
                     let spawn = std::thread::Builder::new()
                         .name("smolvm-net-accept".into())
                         .spawn(move || match listener.accept() {
@@ -1074,6 +1083,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                tcp_egress.as_ref(),
                             ) {
                                 Ok(runtime) => {
                                     if let Some(path) = egress_path {

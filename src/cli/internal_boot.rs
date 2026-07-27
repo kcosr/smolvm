@@ -330,6 +330,20 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         if let Some(parent) = config.ssh_agent_socket.as_ref().and_then(|s| s.parent()) {
             read_write.push(parent.to_path_buf());
         }
+        if let Some(tcp_egress) = &config.resources.tcp_egress {
+            read_write.extend(tcp_egress.access_flow_routes().values().cloned());
+        }
+        if config
+            .resources
+            .tcp_egress
+            .as_ref()
+            .is_some_and(|tcp_egress| !tcp_egress.access_flow_routes().is_empty())
+            && std::env::var_os(smolvm_network::tcp_egress::AWAF_BEARER_ENV).is_none()
+        {
+            if let Some(path) = std::env::var_os(smolvm_network::tcp_egress::AWAF_BEARER_FILE_ENV) {
+                read_exec.push(std::path::PathBuf::from(path));
+            }
+        }
         for (path, read_only, _format) in &config.extra_disks {
             if *read_only {
                 read_exec.push(path.clone());

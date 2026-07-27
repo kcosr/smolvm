@@ -104,6 +104,32 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
+**Route TCP flows through an AW Access Flow proxy.** The host-side virtio-net
+gateway can send selected destination ports to Unix sockets while allowing or
+denying other TCP ports. No guest iptables rules or proxy-aware application
+configuration are required.
+
+```bash
+SMOLVM_AWAF_BEARER="$WORKLOAD_IDENTITY" \
+smolvm machine run \
+  --awaf-route 80=/run/acl-proxy/transparent-http.sock \
+  --awaf-route 443=/run/acl-proxy/transparent-https.sock \
+  --direct-tcp-port 22 \
+  --unmatched-tcp deny \
+  --image alpine -- wget -q -O /dev/null https://example.com
+```
+
+The route flags imply networking and select virtio-net. `--awaf-route` and
+`--direct-tcp-port` are repeatable. Unmatched TCP is direct by default; set
+`--unmatched-tcp deny` for an allow-list. If `SMOLVM_AWAF_BEARER` is unset,
+smolvm sends an explicit anonymous AWAF presentation. Alternatively,
+`SMOLVM_AWAF_BEARER_FILE` may name a host file; the direct value takes
+precedence. A persistent machine stores the route policy from `machine create`,
+while bearer material is resolved from the environment on each `machine start`.
+Guest DNS sent to the virtio-net gateway, including DNS over TCP, continues
+through the gateway's DNS relay and does not enter this destination-port policy.
+Unix-socket AWAF routes are available on Linux and macOS.
+
 **Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
 
 ```toml

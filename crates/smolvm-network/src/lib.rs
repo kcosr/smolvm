@@ -71,11 +71,13 @@ pub mod icmp_relay;
 pub mod netns_tap;
 pub mod queues;
 pub mod stack;
+pub mod tcp_egress;
 pub mod tcp_listeners;
 pub mod tcp_relay;
 pub mod udp_relay;
 
 pub use egress::EgressPolicy;
+pub use tcp_egress::{TcpEgressConfig, UnmatchedTcp};
 
 use socket2::Socket;
 use std::fmt;
@@ -269,7 +271,9 @@ pub fn start_virtio_network(
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
+    tcp_egress_config: Option<&TcpEgressConfig>,
 ) -> io::Result<VirtioNetworkRuntime> {
+    let tcp_egress = tcp_egress::TcpEgressPolicy::from_config(tcp_egress_config)?;
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
         guest_network.guest_ip,
@@ -305,6 +309,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
+        tcp_egress,
     )?;
 
     Ok(VirtioNetworkRuntime {

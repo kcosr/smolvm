@@ -468,6 +468,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
 
+    /// Optional destination-port routing for virtio-net TCP egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_egress: Option<smolvm_network::TcpEgressConfig>,
+
     /// Preferred network backend override for machine launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
@@ -617,6 +621,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            tcp_egress: None,
             network_backend: None,
             dns: None,
             image: None,
@@ -674,6 +679,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            tcp_egress: None,
             network_backend: None,
             dns: None,
             image: None,
@@ -754,6 +760,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            tcp_egress: self.tcp_egress.clone(),
             dns: self.dns,
         }
     }

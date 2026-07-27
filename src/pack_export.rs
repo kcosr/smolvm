@@ -234,6 +234,7 @@ impl ExportVm {
                 storage_gib: None,
                 overlay_gib: None,
                 allowed_cidrs: None,
+                tcp_egress: None,
             },
             features,
         ) {
@@ -578,6 +579,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            tcp_egress: None,
         },
         features,
     )?;

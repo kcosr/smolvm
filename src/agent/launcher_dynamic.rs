@@ -344,6 +344,7 @@ pub fn launch_agent_vm_dynamic(
                     guest_network,
                     &port_mappings,
                     egress,
+                    config.resources.tcp_egress.as_ref(),
                 ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
@@ -399,11 +400,18 @@ pub fn launch_agent_vm_dynamic(
                 // libkrun connects to the path while the VM boots inside the
                 // blocking krun_start_enter, so accept on a background thread; the
                 // runtime parks there until libkrun closes the stream (VM exit).
+                let tcp_egress = config.resources.tcp_egress.clone();
                 let spawn = std::thread::Builder::new()
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress) {
+                            match start_virtio_network(
+                                sock,
+                                guest_network,
+                                &port_mappings,
+                                egress,
+                                tcp_egress.as_ref(),
+                            ) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")
