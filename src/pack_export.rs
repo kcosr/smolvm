@@ -97,24 +97,21 @@ pub fn collect_from_vm_assets(
         export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
-        // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
-        // dir) is flattened on boot and has no registry manifest, so the
-        // in-VM re-pull below cannot source it. Fail with a clear, actionable
-        // message instead of a confusing registry "UNAUTHORIZED" on
-        // `local:<hash>`.
-        if crate::data::image_source::is_local_ref(&image) {
+        if image.starts_with("local:") {
+            export_flattened_from_local_archive(collector, vm_name, &vm_dir, &image)?;
+        } else if crate::data::image_source::is_local_ref(&image) {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
                     "VM '{vm_name}' was created from a local image ({image}). \
-                     `pack create --from-vm` can only snapshot VMs created from a \
-                     REGISTRY image — local archives and rootfs directories are \
-                     flattened on boot and have no registry manifest to re-pull. \
-                     Recreate the machine from a registry reference to pack it."
+                     `pack create --from-vm` cannot snapshot machines created from \
+                     rootfs directories. Recreate the machine from an image archive, \
+                     registry reference, or .smolmachine artifact to pack it."
                 ),
             ));
+        } else {
+            export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
         }
-        export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
         // from the template; a default-size overlay is a qcow2 CoW image and
@@ -284,6 +281,47 @@ impl Drop for ExportVm {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
+}
+
+/// Local-archive machine: reuse the exact flattened rootfs on the source
+/// storage disk, then layer the machine's persistent container changes on top.
+fn export_flattened_from_local_archive(
+    collector: &mut AssetCollector,
+    vm_name: &str,
+    vm_dir: &Path,
+    image: &str,
+) -> crate::Result<()> {
+    let hash = image.strip_prefix("local:").unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::agent(
+            "pack from VM",
+            format!("VM '{vm_name}' has an invalid local image reference: {image}"),
+        ));
+    }
+
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, false)?;
+    let mut client = export_vm.connect()?;
+    export_vm.mount_source_storage(&mut client)?;
+
+    let lower = "/mnt/source-storage/image-archives/packed_layers/0000_rootfs".to_string();
+    let (exit_code, _, _) = client.vm_exec(
+        vec!["test".to_string(), "-d".to_string(), lower.clone()],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    if exit_code != 0 {
+        return Err(Error::agent(
+            "pack from VM",
+            format!(
+                "VM '{vm_name}' is missing its flattened local-image rootfs at {lower}. \
+                 Start the machine once to reconstruct it, then retry the export."
+            ),
+        ));
+    }
+
+    flatten_and_export(collector, &mut client, vm_name, &[lower])
 }
 
 /// Registry-image machine: pull the base image inside the helper VM (layers
