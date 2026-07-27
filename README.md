@@ -84,6 +84,16 @@ smolvm machine run --image ./myapp.tar -- ./app
 smolvm machine run --image ./rootfs/ -- ./app
 ```
 
+The HTTP API uses an explicit host-local source type. The path is resolved on
+the server and must be absolute; because a flattened rootfs has no OCI
+entrypoint metadata, provide the workload command:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/machines \
+  -H 'content-type: application/json' \
+  -d '{"name":"rootfs-vm","source":{"type":"rootfs","path":"/opt/rootfs/alpine"},"cmd":["/bin/sleep","infinity"]}'
+```
+
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
 
 ```bash

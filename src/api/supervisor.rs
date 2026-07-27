@@ -288,6 +288,7 @@ impl Supervisor {
         let ports = record.port_mappings();
         let resources = record.vm_resources();
         let source_smolmachine = record.source_smolmachine.clone();
+        let source_image = record.image.clone();
         let dns_filter_hosts = record.dns_filter_hosts.clone();
         let name_for_features = name.to_string();
 
@@ -298,6 +299,7 @@ impl Supervisor {
             let features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
+                source_image.as_deref(),
                 dns_filter_hosts,
             )?;
             entry

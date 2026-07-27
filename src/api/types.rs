@@ -473,6 +473,20 @@ pub struct ApiErrorResponse {
 // Machine Types
 // ============================================================================
 
+/// Host-local source used to create a machine.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum MachineSource {
+    /// An already-unpacked Linux root filesystem. The API server uses this
+    /// directory in place as a shared overlay lower; each machine stores only
+    /// its private copy-on-write upper.
+    Rootfs {
+        /// Absolute path on the API server host.
+        #[schema(example = "/opt/smolvm/rootfs/alpine")]
+        path: String,
+    },
+}
+
 /// Request to create a new machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -538,11 +552,17 @@ pub struct CreateMachineRequest {
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,
-    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
+    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with
+    /// `source`, `from`, and `registryRef`.
     #[serde(default)]
     pub image: Option<String>,
+    /// Typed host-local machine source. Mutually exclusive with `image`,
+    /// `from`, and `registryRef`.
+    #[serde(default)]
+    pub source: Option<MachineSource>,
     /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
-    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    /// layers instead of pulling from a registry. Mutually exclusive with
+    /// `image`, `source`, and `registryRef`.
     #[serde(default)]
     pub from: Option<String>,
     /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").

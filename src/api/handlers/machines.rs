@@ -37,8 +37,8 @@ use crate::api::state::{
 };
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MachineSource, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -168,6 +168,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         },
         restart: record.restart.clone(),
         network: record.network,
+        image: record.image.clone(),
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
     }
@@ -302,19 +303,34 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Validate: registry_ref, from, and image are mutually exclusive
+    // Validate all machine source forms before resolving any of them.
     let source_count = [
         req.registry_ref.is_some(),
         req.from.is_some(),
         req.image.is_some(),
+        req.source.is_some(),
     ]
     .iter()
     .filter(|&&b| b)
     .count();
     if source_count > 1 {
         return Err(ApiError::BadRequest(
-            "'registryRef', 'from', and 'image' are mutually exclusive".to_string(),
+            "'registryRef', 'from', 'image', and 'source' are mutually exclusive".to_string(),
         ));
+    }
+    if let Some(image) = req.image.as_deref() {
+        if crate::data::image_source::is_local_ref(image)
+            || !matches!(
+                crate::data::image_source::classify(image),
+                crate::data::image_source::ImageSource::Registry(_)
+            )
+        {
+            return Err(ApiError::BadRequest(
+                "API 'image' accepts registry references only; use \
+                 source.type='rootfs' for an unpacked host rootfs"
+                    .to_string(),
+            ));
+        }
     }
 
     // Published ports need the inbound path that only virtio-net has. With an
@@ -331,8 +347,41 @@ pub async fn create_machine(
         ));
     }
 
-    // If registry_ref is set, pull the artifact from the registry and treat as `from`
+    // Resolve a typed rootfs source to the same stable local-dir reference used
+    // by the CLI. The canonical host directory remains the shared overlay lower;
+    // no rootfs bytes are copied into the machine record or private data dir.
     let mut req = req;
+    if let Some(MachineSource::Rootfs { path }) = req.source.clone() {
+        let rootfs = std::path::PathBuf::from(&path);
+        if !rootfs.is_absolute() {
+            return Err(ApiError::BadRequest(format!(
+                "rootfs source path must be absolute: {}",
+                rootfs.display()
+            )));
+        }
+        if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            return Err(ApiError::BadRequest(
+                "a rootfs source has no OCI entrypoint metadata; provide 'entrypoint' or 'cmd'"
+                    .to_string(),
+            ));
+        }
+        let resolved = tokio::task::spawn_blocking(move || {
+            crate::data::image_source::resolve(crate::data::image_source::ImageSource::Directory(
+                rootfs,
+            ))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("rootfs resolution task: {e}")))?
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let crate::data::image_source::ResolvedImage::Local { reference, .. } = resolved else {
+            return Err(ApiError::internal(
+                "rootfs source unexpectedly resolved as a registry image",
+            ));
+        };
+        req.image = Some(reference);
+    }
+
+    // If registry_ref is set, pull the artifact from the registry and treat as `from`
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(
             registry_ref,
@@ -350,7 +399,11 @@ pub async fn create_machine(
     // OCI puller would unpack its multi-GiB storage.ext4 into the guest disk.
     // Probe the manifest on the host and reroute through the same from-sidecar
     // flow as `registryRef`; a failed probe falls back to the in-guest pull.
-    if let Some(image) = req.image.clone() {
+    if let Some(image) = req
+        .image
+        .clone()
+        .filter(|image| !crate::data::image_source::is_local_ref(image))
+    {
         let sidecar = crate::data::pack_ref::resolve_pack_ref(
             &image,
             req.registry_identity_token.as_deref(),
@@ -999,6 +1052,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let source_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
     let forkable = query.forkable;
@@ -1010,6 +1064,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            source_image.as_deref(),
             dns_filter_hosts,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
@@ -1081,6 +1136,7 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
+        let image_is_local = crate::data::image_source::is_local_ref(&image_pull);
         // Caller-supplied credentials win over the node's own registry config:
         // that config is operator-level and shared by every tenant, so it can
         // never hold a customer's private-registry password. `PullOptions::auth`
@@ -1088,7 +1144,7 @@ pub async fn start_machine(
         // enough — and passing `None` leaves the previous behaviour untouched.
         let pull_auth = registry_auth.clone();
         let pull = with_machine_client_traced(&entry, None, move |c| {
-            if c.query(&image_pull)?.is_none() {
+            if !image_is_local && c.query(&image_pull)?.is_none() {
                 let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
                 if let Some(auth) = pull_auth {
                     opts = opts.auth(auth);
@@ -1298,6 +1354,7 @@ pub async fn fork_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.image.as_deref(),
             record.dns_filter_hosts.clone(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
@@ -2372,6 +2429,7 @@ mod tests {
             network_backend: None,
             restart: None,
             image: None,
+            source: None,
             from: None,
             registry_ref: None,
             registry_identity_token: None,
@@ -2424,6 +2482,26 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn create_request_accepts_typed_rootfs_source() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "rootfs-vm",
+            "source": {
+                "type": "rootfs",
+                "path": "/opt/smolvm/rootfs/alpine"
+            },
+            "cmd": ["/bin/sleep", "infinity"]
+        }))
+        .unwrap();
+
+        match req.source {
+            Some(MachineSource::Rootfs { path }) => {
+                assert_eq!(path, "/opt/smolvm/rootfs/alpine");
+            }
+            _ => panic!("expected typed rootfs source"),
+        }
     }
 
     #[test]

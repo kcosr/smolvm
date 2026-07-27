@@ -83,6 +83,9 @@ pub struct MachineEntry {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Persisted image reference. Local rootfs sources use `local-dir:<path>`;
+    /// API start paths derive their virtiofs lower directory from this value.
+    pub image: Option<String>,
     /// Secret refs persisted on the VM record, cached in memory so
     /// exec handlers don't need a second DB read per request. Exec
     /// handlers resolve these under `RecordReplay` scope.
@@ -383,6 +386,7 @@ impl ApiState {
                             resources,
                             restart: record.restart.clone(),
                             network: record.network,
+                            image: record.image.clone(),
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.source_smolmachine.clone(),
                         })),
@@ -826,7 +830,7 @@ impl ApiState {
         record.gpu = reg.resources.gpu;
         record.cuda = reg.resources.cuda.unwrap_or(false);
         record.docker_socket = reg.docker_socket;
-        record.image = reg.image;
+        record.image = reg.image.clone();
         record.source_smolmachine = reg.source_smolmachine.clone();
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
@@ -856,6 +860,7 @@ impl ApiState {
                         resources: reg.resources,
                         restart: reg.restart,
                         network: reg.network,
+                        image: reg.image,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
                     })),
@@ -1086,14 +1091,15 @@ where
 /// (`source_smolmachine` is set), its pre-extracted OCI layers — extracted into
 /// the machine's own data dir at create time, keyed by `machine_name` — are
 /// mounted via virtiofs so the guest uses them instead of pulling from a
-/// registry; otherwise default features are returned. Without it the three API
-/// start entrypoints (`start_machine`, `ensure_machine_running`, supervisor
-/// restart) would pass `packed_layers_dir = None` and the guest would fall back
-/// to a network pull. Performs blocking filesystem work — call from within a
-/// `spawn_blocking` context.
+/// registry. A `local-dir:` image reference similarly reattaches an unpacked
+/// rootfs directory in place. Without this the API start entrypoints would pass
+/// `packed_layers_dir = None` and the guest would fall back to a network pull.
+/// Performs blocking filesystem work — call from within a `spawn_blocking`
+/// context.
 pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
+    image: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
@@ -1104,6 +1110,10 @@ pub fn build_launch_features(
         )?,
         None => features,
     };
+    if features.packed_layers_dir.is_none() {
+        features.packed_layers_dir =
+            image.and_then(crate::data::image_source::packed_layers_dir_for_ref);
+    }
     // Carry the egress hostname allow-list into the boot config; `internal_boot`
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
@@ -1148,18 +1158,23 @@ pub async fn ensure_machine_running(
         // wasted work — on macOS it re-mounts the case-sensitive volume via
         // hdiutil — so gate it on the same already-running check.
         //
-        // The gated `default()` is safe across the relaunch branch too: if the
-        // preflight detects a mount/port/resource change and restarts the VM,
-        // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
-        // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
-        // restart keeps using them instead of falling back to a registry pull.
+        // The gated `default()` is safe for `.smolmachine` layers across the
+        // relaunch branch: `ensure_running_via_subprocess` can rediscover their
+        // per-machine extraction. A host-local rootfs is external to that cache,
+        // so retain its explicit launch feature even on the hot path in case a
+        // config change turns this preflight into a restart.
         let already_up = entry.manager.try_connect_existing().is_some();
-        let features = if already_up {
+        let uses_local_rootfs = entry
+            .image
+            .as_deref()
+            .is_some_and(crate::data::image_source::is_local_ref);
+        let features = if already_up && !uses_local_rootfs {
             crate::agent::LaunchFeatures::default()
         } else {
             build_launch_features(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
+                entry.image.as_deref(),
                 entry.resources.allowed_hosts.clone(),
             )?
         };
@@ -1222,6 +1237,8 @@ pub async fn ensure_running_and_persist(
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
+        e.image = record.image.clone();
+        e.source_smolmachine = record.source_smolmachine.clone();
     }
 
     let freshly_booted = ensure_machine_running(entry).await?;
@@ -1302,8 +1319,9 @@ async fn relaunch_image_workload(
     let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
 
     let image_pull = image.clone();
+    let image_is_local = crate::data::image_source::is_local_ref(&image_pull);
     with_machine_client_traced(entry, None, move |c| {
-        if c.query(&image_pull)?.is_none() {
+        if !image_is_local && c.query(&image_pull)?.is_none() {
             c.pull_with_registry_config(&image_pull)?;
         }
         Ok(())
@@ -1557,12 +1575,23 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let features = build_launch_features(None, None, None, Some(hosts.clone())).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
+    }
+
+    #[test]
+    fn build_launch_features_reattaches_local_rootfs() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("bin")).unwrap();
+        let reference = format!("local-dir:{}", rootfs.path().display());
+
+        let features = build_launch_features(None, None, Some(&reference), None).unwrap();
+
+        assert_eq!(features.packed_layers_dir.as_deref(), Some(rootfs.path()));
     }
 
     #[test]
@@ -1609,6 +1638,7 @@ mod tests {
                 },
                 restart: RestartConfig::default(),
                 network: false,
+                image: None,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
             },
@@ -1672,6 +1702,7 @@ mod tests {
                 },
                 restart: RestartConfig::default(),
                 network: false,
+                image: None,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
             },
