@@ -77,7 +77,7 @@ pub mod tcp_relay;
 pub mod udp_relay;
 
 pub use egress::EgressPolicy;
-pub use tcp_egress::{TcpEgressConfig, UnmatchedTcp};
+pub use tcp_egress::{AccessFlowEndpoint, TcpEgressConfig, UnmatchedTcp};
 
 use socket2::Socket;
 use std::fmt;
@@ -273,7 +273,35 @@ pub fn start_virtio_network(
     egress: EgressPolicy,
     tcp_egress_config: Option<&TcpEgressConfig>,
 ) -> io::Result<VirtioNetworkRuntime> {
-    let tcp_egress = tcp_egress::TcpEgressPolicy::from_config(tcp_egress_config)?;
+    let tcp_egress = prepare_tcp_egress(tcp_egress_config)?;
+    start_virtio_network_prepared(
+        host_stream,
+        guest_network,
+        published_ports,
+        egress,
+        tcp_egress,
+    )
+}
+
+/// Prepared TCP egress policy with launch-time secrets and trust material loaded.
+///
+/// This is opaque so callers can prepare the policy before asynchronous device
+/// setup without gaining access to resolved bearer material.
+pub struct PreparedTcpEgress(tcp_egress::TcpEgressPolicy);
+
+/// Resolve and validate a TCP egress policy before reporting VM startup.
+pub fn prepare_tcp_egress(config: Option<&TcpEgressConfig>) -> io::Result<PreparedTcpEgress> {
+    tcp_egress::TcpEgressPolicy::from_config(config).map(PreparedTcpEgress)
+}
+
+/// Start virtio-net with a policy prepared synchronously by the launcher.
+pub fn start_virtio_network_prepared(
+    host_stream: Socket,
+    guest_network: GuestNetworkConfig,
+    published_ports: &[PortMapping],
+    egress: EgressPolicy,
+    tcp_egress: PreparedTcpEgress,
+) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
         guest_network.guest_ip,
@@ -309,7 +337,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
-        tcp_egress,
+        tcp_egress.0,
     )?;
 
     Ok(VirtioNetworkRuntime {

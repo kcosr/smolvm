@@ -90,26 +90,67 @@ fn build_tcp_egress_config(
     awaf_routes: &[String],
     direct_ports: &[u16],
     unmatched: Option<smolvm_network::UnmatchedTcp>,
+    tls_server_name: Option<&str>,
+    tls_trust: Option<&Path>,
 ) -> smolvm::Result<Option<smolvm_network::TcpEgressConfig>> {
-    if awaf_routes.is_empty() && direct_ports.is_empty() && unmatched.is_none() {
+    if awaf_routes.is_empty()
+        && direct_ports.is_empty()
+        && unmatched.is_none()
+        && tls_server_name.is_none()
+        && tls_trust.is_none()
+    {
         return Ok(None);
     }
 
     let mut routes = BTreeMap::new();
+    let mut has_tls_route = false;
     for spec in awaf_routes {
-        let (port, socket) = spec.split_once('=').ok_or_else(|| {
-            smolvm::Error::config("--awaf-route", "expected PORT=/absolute/socket/path")
+        let (port, endpoint) = spec.split_once('=').ok_or_else(|| {
+            smolvm::Error::config(
+                "--awaf-route",
+                "expected PORT=unix:///absolute/socket or PORT=tls://HOST:PORT",
+            )
         })?;
         let port = port.parse::<u16>().map_err(|_| {
             smolvm::Error::config("--awaf-route", format!("invalid TCP port '{port}'"))
         })?;
-        let socket = PathBuf::from(socket);
-        if routes.insert(port, socket).is_some() {
+        let endpoint = if let Some(path) = endpoint.strip_prefix("unix://") {
+            smolvm_network::AccessFlowEndpoint::unix(PathBuf::from(path))
+        } else if let Some(address) = endpoint.strip_prefix("tls://") {
+            has_tls_route = true;
+            let server_name = tls_server_name.ok_or_else(|| {
+                smolvm::Error::config(
+                    "--awaf-tls-server-name",
+                    "required when --awaf-route uses tls://",
+                )
+            })?;
+            let trust_path = tls_trust.ok_or_else(|| {
+                smolvm::Error::config("--awaf-tls-trust", "required when --awaf-route uses tls://")
+            })?;
+            smolvm_network::AccessFlowEndpoint::tls_tcp(
+                address.to_string(),
+                server_name.to_string(),
+                trust_path.to_path_buf(),
+            )
+        } else {
+            return Err(smolvm::Error::config(
+                "--awaf-route",
+                "endpoint must start with unix:// or tls://",
+            ));
+        }
+        .map_err(|error| smolvm::Error::config("--awaf-route", error.to_string()))?;
+        if routes.insert(port, endpoint).is_some() {
             return Err(smolvm::Error::config(
                 "--awaf-route",
                 format!("duplicate AWAF route for TCP port {port}"),
             ));
         }
+    }
+    if !has_tls_route && (tls_server_name.is_some() || tls_trust.is_some()) {
+        return Err(smolvm::Error::config(
+            "AWAF TLS",
+            "--awaf-tls-server-name and --awaf-tls-trust require a tls:// AWAF route",
+        ));
     }
 
     let direct_port_count = direct_ports.len();
@@ -124,6 +165,25 @@ fn build_tcp_egress_config(
     smolvm_network::TcpEgressConfig::new(routes, direct_ports, unmatched.unwrap_or_default())
         .map(Some)
         .map_err(|error| smolvm::Error::config("TCP egress", error.to_string()))
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AwafTlsArgs {
+    /// Certificate verification name for every tls:// AWAF route.
+    #[arg(
+        long = "awaf-tls-server-name",
+        value_name = "DNS_NAME|IP",
+        help_heading = "Network"
+    )]
+    pub awaf_tls_server_name: Option<String>,
+
+    /// Explicit PEM trust bundle for every tls:// AWAF route.
+    #[arg(
+        long = "awaf-tls-trust",
+        value_name = "ABSOLUTE_PATH",
+        help_heading = "Network"
+    )]
+    pub awaf_tls_trust: Option<PathBuf>,
 }
 
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
@@ -429,7 +489,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file", "awaf_route", "direct_tcp_port", "unmatched_tcp"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file", "awaf_route", "awaf_tls_server_name", "awaf_tls_trust", "direct_tcp_port", "unmatched_tcp"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -521,13 +581,16 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
 
-    /// Route a TCP destination port through an AWAF Unix socket (repeatable).
+    /// Route a TCP destination port through an AWAF Unix or TLS connector.
     #[arg(
         long = "awaf-route",
-        value_name = "PORT=/ABSOLUTE/SOCKET",
+        value_name = "PORT=unix:///PATH|PORT=tls://HOST:PORT",
         help_heading = "Network"
     )]
     pub awaf_route: Vec<String>,
+
+    #[command(flatten)]
+    pub awaf_tls: Box<AwafTlsArgs>,
 
     /// Permit direct host TCP connections to this destination port (repeatable).
     #[arg(long = "direct-tcp-port", value_parser = clap::value_parser!(u16).range(1..), value_name = "PORT", help_heading = "Network")]
@@ -980,8 +1043,13 @@ impl RunCmd {
             self.outbound_localhost_only,
             self.net,
         )?;
-        let tcp_egress =
-            build_tcp_egress_config(&self.awaf_route, &self.direct_tcp_port, self.unmatched_tcp)?;
+        let tcp_egress = build_tcp_egress_config(
+            &self.awaf_route,
+            &self.direct_tcp_port,
+            self.unmatched_tcp,
+            self.awaf_tls.awaf_tls_server_name.as_deref(),
+            self.awaf_tls.awaf_tls_trust.as_deref(),
+        )?;
 
         let params = crate::cli::smolfile::build_create_params(
             vm_name.clone(),
@@ -1826,6 +1894,17 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn absolute_test_path(name: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"C:\smolvm-tests\{name}"))
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/tmp").join(name)
+        }
+    }
+
     #[test]
     fn init_layer_key_is_stable_and_input_sensitive() {
         let init = vec!["apt-get install -y jq".to_string()];
@@ -1914,25 +1993,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn builds_tcp_egress_routes_from_cli_values() {
         let config = build_tcp_egress_config(
             &[
-                "80=/run/acl/http.sock".to_string(),
-                "443=/run/acl/https.sock".to_string(),
+                "80=unix:///run/acl/http.sock".to_string(),
+                "443=unix:///run/acl/https.sock".to_string(),
             ],
             &[22],
             Some(smolvm_network::UnmatchedTcp::Deny),
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
 
         assert_eq!(
             config.access_flow_routes().get(&80),
-            Some(&PathBuf::from("/run/acl/http.sock"))
+            Some(
+                &smolvm_network::AccessFlowEndpoint::unix(PathBuf::from("/run/acl/http.sock"))
+                    .unwrap()
+            )
         );
         assert_eq!(
             config.access_flow_routes().get(&443),
-            Some(&PathBuf::from("/run/acl/https.sock"))
+            Some(
+                &smolvm_network::AccessFlowEndpoint::unix(PathBuf::from("/run/acl/https.sock"))
+                    .unwrap()
+            )
         );
         assert_eq!(config.direct_ports(), &BTreeSet::from([22]));
         assert_eq!(config.unmatched(), smolvm_network::UnmatchedTcp::Deny);
@@ -1940,21 +2028,65 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_or_invalid_tcp_egress_routes() {
-        assert!(build_tcp_egress_config(&["443=relative.sock".to_string()], &[], None).is_err());
         assert!(build_tcp_egress_config(
-            &[
-                "443=/run/acl/one.sock".to_string(),
-                "443=/run/acl/two.sock".to_string(),
-            ],
+            &["443=unix://relative.sock".to_string()],
             &[],
+            None,
+            None,
             None,
         )
         .is_err());
-        assert!(
-            build_tcp_egress_config(&["443=/run/acl/https.sock".to_string()], &[443], None,)
-                .is_err()
+        assert!(build_tcp_egress_config(
+            &[
+                "443=unix:///run/acl/one.sock".to_string(),
+                "443=unix:///run/acl/two.sock".to_string(),
+            ],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(build_tcp_egress_config(
+            &["443=unix:///run/acl/https.sock".to_string()],
+            &[443],
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(build_tcp_egress_config(&[], &[22, 22], None, None, None).is_err());
+        assert!(build_tcp_egress_config(
+            &["443=tls://127.0.0.1:7444".to_string()],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn builds_tls_tcp_egress_route_from_cli_values() {
+        let trust_path = absolute_test_path("proxy-roots.pem");
+        let config = build_tcp_egress_config(
+            &["443=tls://127.0.0.1:7444".to_string()],
+            &[],
+            Some(smolvm_network::UnmatchedTcp::Deny),
+            Some("proxy.example.test"),
+            Some(&trust_path),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            config.access_flow_routes().get(&443),
+            Some(&smolvm_network::AccessFlowEndpoint::TlsTcp {
+                address: "127.0.0.1:7444".to_string(),
+                server_name: "proxy.example.test".to_string(),
+                trust_path,
+            })
         );
-        assert!(build_tcp_egress_config(&[], &[22, 22], None).is_err());
     }
 
     #[derive(Parser, Debug)]
@@ -1983,7 +2115,7 @@ mod tests {
             "machine",
             "run",
             "--awaf-route",
-            "80=/run/acl/http.sock",
+            "80=unix:///run/acl/http.sock",
             "--direct-tcp-port",
             "22",
             "--unmatched-tcp",
@@ -1992,7 +2124,7 @@ mod tests {
         let MachineCmd::Run(run) = run.command else {
             panic!("expected machine run command");
         };
-        assert_eq!(run.awaf_route, ["80=/run/acl/http.sock"]);
+        assert_eq!(run.awaf_route, ["80=unix:///run/acl/http.sock"]);
         assert_eq!(run.direct_tcp_port, [22]);
         assert_eq!(run.unmatched_tcp, Some(smolvm_network::UnmatchedTcp::Deny));
 
@@ -2002,12 +2134,24 @@ mod tests {
             "--name",
             "routed",
             "--awaf-route",
-            "443=/run/acl/https.sock",
+            "443=tls://127.0.0.1:7444",
+            "--awaf-tls-server-name",
+            "proxy.example.test",
+            "--awaf-tls-trust",
+            "/etc/smolvm/proxy-roots.pem",
         ]);
         let MachineCmd::Create(create) = create.command else {
             panic!("expected machine create command");
         };
-        assert_eq!(create.awaf_route, ["443=/run/acl/https.sock"]);
+        assert_eq!(create.awaf_route, ["443=tls://127.0.0.1:7444"]);
+        assert_eq!(
+            create.awaf_tls.awaf_tls_server_name.as_deref(),
+            Some("proxy.example.test")
+        );
+        assert_eq!(
+            create.awaf_tls.awaf_tls_trust.as_deref(),
+            Some(Path::new("/etc/smolvm/proxy-roots.pem"))
+        );
     }
 
     // Documents the clap parsing behaviour: positionals before "--" land in
@@ -2460,9 +2604,15 @@ pub struct CreateCmd {
     #[arg(long)]
     pub outbound_localhost_only: bool,
 
-    /// Route a TCP destination port through an AWAF Unix socket (repeatable).
-    #[arg(long = "awaf-route", value_name = "PORT=/ABSOLUTE/SOCKET")]
+    /// Route a TCP destination port through an AWAF Unix or TLS connector.
+    #[arg(
+        long = "awaf-route",
+        value_name = "PORT=unix:///PATH|PORT=tls://HOST:PORT"
+    )]
     pub awaf_route: Vec<String>,
+
+    #[command(flatten)]
+    pub awaf_tls: Box<AwafTlsArgs>,
 
     /// Permit direct host TCP connections to this destination port (repeatable).
     #[arg(long = "direct-tcp-port", value_parser = clap::value_parser!(u16).range(1..), value_name = "PORT")]
@@ -2587,8 +2737,13 @@ impl CreateCmd {
             self.outbound_localhost_only,
             self.net,
         )?;
-        let tcp_egress =
-            build_tcp_egress_config(&self.awaf_route, &self.direct_tcp_port, self.unmatched_tcp)?;
+        let tcp_egress = build_tcp_egress_config(
+            &self.awaf_route,
+            &self.direct_tcp_port,
+            self.unmatched_tcp,
+            self.awaf_tls.awaf_tls_server_name.as_deref(),
+            self.awaf_tls.awaf_tls_trust.as_deref(),
+        )?;
 
         let name = self
             .name
@@ -2833,6 +2988,8 @@ impl CreateCmd {
                 &self.awaf_route,
                 &self.direct_tcp_port,
                 self.unmatched_tcp,
+                self.awaf_tls.awaf_tls_server_name.as_deref(),
+                self.awaf_tls.awaf_tls_trust.as_deref(),
             )?,
             restart_policy: None,
             restart_max_retries: None,

@@ -28,7 +28,7 @@
 
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
-use crate::tcp_egress::{AccessFlowProxy, TcpEgressPolicy, TcpRoute};
+use crate::tcp_egress::{AccessFlowProxy, AccessFlowStream, TcpEgressPolicy, TcpRoute};
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -36,8 +36,6 @@ use smoltcp::wire::IpListenEndpoint;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -130,7 +128,7 @@ struct PendingProxyEndpoints {
 pub enum RelayTarget {
     /// Open a new outbound host `TcpStream` to the destination.
     Connect(SocketAddr),
-    /// Open one AWAF connection to the configured Unix socket.
+    /// Open one AWAF connection to the configured host connector.
     AccessFlow(Arc<AccessFlowProxy>),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
@@ -654,23 +652,12 @@ fn tcp_relay_loop(
                 "virtio-net: connecting AWAF relay destination={}",
                 destination
             );
-            #[cfg(unix)]
-            {
-                let stream = proxy.connect(destination)?;
-                virtio_net_log!(
-                    "virtio-net: AWAF relay connected destination={}",
-                    destination
-                );
-                HostRelayStream::Unix(stream)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = proxy;
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "AWAF Unix socket egress is unsupported on this host",
-                ));
-            }
+            let stream = proxy.connect(destination)?;
+            virtio_net_log!(
+                "virtio-net: AWAF relay connected destination={}",
+                destination
+            );
+            HostRelayStream::AccessFlow(stream)
         }
         RelayTarget::Attached(stream) => {
             virtio_net_log!(
@@ -738,8 +725,14 @@ fn tcp_relay_loop(
         if guest_channel_closed && pending_guest_data.is_none() && !guest_write_closed {
             // The guest side closed its write half. Mirror that toward the
             // remote peer only after all buffered guest bytes were written.
-            let _ = stream.shutdown(Shutdown::Write);
-            guest_write_closed = true;
+            match stream.shutdown(Shutdown::Write) {
+                Ok(()) => {
+                    guest_write_closed = true;
+                    did_work = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
         }
 
         // Both directions are done — the host stopped sending (host_read_closed)
@@ -782,24 +775,21 @@ fn tcp_relay_loop(
 
 enum HostRelayStream {
     Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(UnixStream),
+    AccessFlow(AccessFlowStream),
 }
 
 impl HostRelayStream {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_nonblocking(nonblocking),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.set_nonblocking(nonblocking),
+            Self::AccessFlow(stream) => stream.set_nonblocking(nonblocking),
         }
     }
 
-    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+    fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.shutdown(how),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.shutdown(how),
+            Self::AccessFlow(stream) => stream.shutdown(how),
         }
     }
 }
@@ -808,8 +798,7 @@ impl Read for HostRelayStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.read(buffer),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.read(buffer),
+            Self::AccessFlow(stream) => stream.read(buffer),
         }
     }
 }
@@ -818,16 +807,14 @@ impl Write for HostRelayStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.write(buffer),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.write(buffer),
+            Self::AccessFlow(stream) => stream.write(buffer),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.flush(),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.flush(),
+            Self::AccessFlow(stream) => stream.flush(),
         }
     }
 }
@@ -895,6 +882,16 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tcp_egress::AccessFlowProxy;
+    use rcgen::generate_simple_self_signed;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    const TEST_ALPN: &[u8] = b"aw-access-flow/1";
+    const TEST_BEARER: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -928,5 +925,78 @@ mod tests {
 
         assert!(connection.buffered_guest_data.is_none());
         assert_eq!(from_smoltcp.recv().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn tls_access_flow_relay_moves_data_and_half_closes() {
+        let generated =
+            generate_simple_self_signed(vec!["proxy.example.test".to_string()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(generated.cert.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap();
+        let mut client = builder.with_root_certificates(roots).with_no_client_auth();
+        client.alpn_protocols = vec![TEST_ALPN.to_vec()];
+
+        let builder = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap();
+        let private_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
+        let mut server = builder
+            .with_no_client_auth()
+            .with_single_cert(vec![generated.cert.der().clone()], private_key)
+            .unwrap();
+        server.alpn_protocols = vec![TEST_ALPN.to_vec()];
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let proxy = AccessFlowProxy::tls_for_test(
+            listener.local_addr().unwrap(),
+            ServerName::try_from("proxy.example.test".to_string()).unwrap(),
+            Arc::new(client),
+            TEST_BEARER.to_vec(),
+        );
+        let server_thread = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(Arc::new(server)).unwrap();
+            let mut stream = StreamOwned::new(connection, tcp);
+            let mut preface = vec![0; 16 + TEST_BEARER.len()];
+            stream.read_exact(&mut preface).unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").unwrap();
+            stream.conn.send_close_notify();
+            stream.flush().unwrap();
+            let mut remainder = Vec::new();
+            stream.read_to_end(&mut remainder).unwrap();
+        });
+
+        let (guest_sender, from_smoltcp) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_smoltcp, guest_receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let wake = Arc::new(WakePipe::new());
+        let exit = RelayExitState::new();
+        let destination = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 10).into(), 443);
+        let relay = thread::spawn(move || {
+            tcp_relay_loop(
+                destination,
+                RelayTarget::AccessFlow(proxy),
+                from_smoltcp,
+                to_smoltcp,
+                wake,
+                &exit,
+            )
+        });
+
+        guest_sender.send(b"ping".to_vec()).unwrap();
+        assert_eq!(
+            guest_receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"pong"
+        );
+        drop(guest_sender);
+        assert_eq!(relay.join().unwrap().unwrap(), RelayExitMode::Graceful);
+        server_thread.join().unwrap();
     }
 }
