@@ -25,7 +25,7 @@ struct Cli {
 enum Commands {
     /// Manage machines (create, start, stop, exec)
     #[command(subcommand, visible_alias = "vm")]
-    Machine(cli::machine::MachineCmd),
+    Machine(Box<cli::machine::MachineCmd>),
 
     /// Start the HTTP API server for programmatic control
     #[command(subcommand)]
@@ -143,7 +143,7 @@ fn main() {
     // Execute command
     // Note: orphan cleanup is handled per-command (skipped for ephemeral `machine run`).
     let result = match cli.command {
-        Commands::Machine(cmd) => cmd.run(),
+        Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),

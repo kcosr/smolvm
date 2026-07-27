@@ -400,17 +400,24 @@ pub fn launch_agent_vm_dynamic(
                 // libkrun connects to the path while the VM boots inside the
                 // blocking krun_start_enter, so accept on a background thread; the
                 // runtime parks there until libkrun closes the stream (VM exit).
-                let tcp_egress = config.resources.tcp_egress.clone();
+                let tcp_egress = match smolvm_network::prepare_tcp_egress(
+                    config.resources.tcp_egress.as_ref(),
+                ) {
+                    Ok(policy) => policy,
+                    Err(err) => {
+                        free_ctx_on_err!(format!("failed to prepare TCP egress: {err}"))
+                    }
+                };
                 let spawn = std::thread::Builder::new()
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(
+                            match smolvm_network::start_virtio_network_prepared(
                                 sock,
                                 guest_network,
                                 &port_mappings,
                                 egress,
-                                tcp_egress.as_ref(),
+                                tcp_egress,
                             ) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {

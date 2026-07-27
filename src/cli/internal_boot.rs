@@ -331,7 +331,14 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             read_write.push(parent.to_path_buf());
         }
         if let Some(tcp_egress) = &config.resources.tcp_egress {
-            read_write.extend(tcp_egress.access_flow_routes().values().cloned());
+            for endpoint in tcp_egress.access_flow_routes().values() {
+                if let Some(path) = endpoint.unix_socket_path() {
+                    read_write.push(path.to_path_buf());
+                }
+                if let Some(path) = endpoint.tls_trust_path() {
+                    read_exec.push(path.to_path_buf());
+                }
+            }
         }
         if config
             .resources

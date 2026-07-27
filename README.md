@@ -105,16 +105,30 @@ smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
 **Route TCP flows through an AW Access Flow proxy.** The host-side virtio-net
-gateway can send selected destination ports to Unix sockets while allowing or
-denying other TCP ports. No guest iptables rules or proxy-aware application
-configuration are required.
+gateway can send selected destination ports through Unix sockets or
+server-authenticated TLS/TCP while allowing or denying other TCP ports. No
+guest iptables rules or proxy-aware application configuration are required.
 
 ```bash
 SMOLVM_AWAF_BEARER="$WORKLOAD_IDENTITY" \
 smolvm machine run \
-  --awaf-route 80=/run/acl-proxy/transparent-http.sock \
-  --awaf-route 443=/run/acl-proxy/transparent-https.sock \
+  --awaf-route 80=unix:///run/acl-proxy/transparent-http.sock \
+  --awaf-route 443=unix:///run/acl-proxy/transparent-https.sock \
   --direct-tcp-port 22 \
+  --unmatched-tcp deny \
+  --image alpine -- wget -q -O /dev/null https://example.com
+```
+
+For native Windows or a proxy reached over the network, use the ACL proxy's
+TLS/TCP Access Flow listeners:
+
+```bash
+SMOLVM_AWAF_BEARER="$WORKLOAD_IDENTITY" \
+smolvm machine run \
+  --awaf-route 80=tls://127.0.0.1:7443 \
+  --awaf-route 443=tls://127.0.0.1:7444 \
+  --awaf-tls-server-name proxy.example.test \
+  --awaf-tls-trust /absolute/path/to/acl-proxy-roots.pem \
   --unmatched-tcp deny \
   --image alpine -- wget -q -O /dev/null https://example.com
 ```
@@ -122,13 +136,21 @@ smolvm machine run \
 The route flags imply networking and select virtio-net. `--awaf-route` and
 `--direct-tcp-port` are repeatable. Unmatched TCP is direct by default; set
 `--unmatched-tcp deny` for an allow-list. If `SMOLVM_AWAF_BEARER` is unset,
-smolvm sends an explicit anonymous AWAF presentation. Alternatively,
-`SMOLVM_AWAF_BEARER_FILE` may name a host file; the direct value takes
-precedence. A persistent machine stores the route policy from `machine create`,
-while bearer material is resolved from the environment on each `machine start`.
+smolvm sends an explicit anonymous AWAF presentation to Unix endpoints. TLS
+endpoints require a bearer. Alternatively, `SMOLVM_AWAF_BEARER_FILE` may name a
+host file; the direct value takes precedence. TLS uses TLS 1.3 and exact ALPN
+`aw-access-flow/1`, verifies `--awaf-tls-server-name`, and trusts only
+certificates in `--awaf-tls-trust`. A private CA or self-signed proxy
+certificate can be supplied in that PEM bundle; certificate verification is
+not disabled. On Windows, protect the trust bundle with a filesystem ACL that
+allows writes only by the machine operator and administrators; smolvm rejects
+symlinks and reparse points but does not interpret Windows ACLs. A persistent
+machine stores the route and trust configuration from `machine create`, while
+bearer material is resolved from the environment on each `machine start`.
 Guest DNS sent to the virtio-net gateway, including DNS over TCP, continues
-through the gateway's DNS relay and does not enter this destination-port policy.
-Unix-socket AWAF routes are available on Linux and macOS.
+through the gateway's DNS relay and does not enter this destination-port
+policy. Unix endpoints are available on Linux and macOS; TLS/TCP endpoints are
+portable across supported hosts.
 
 **Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
 
