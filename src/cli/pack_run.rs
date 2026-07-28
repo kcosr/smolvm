@@ -268,6 +268,10 @@ pub struct PackRunCmd {
     /// was created with CUDA, or via `SMOLVM_CUDA=1`.
     #[arg(long)]
     pub cuda: bool,
+
+    /// Host-side TCP egress routing supplied by `machine run --from`.
+    #[arg(skip)]
+    pub tcp_egress: Option<smolvm_network::TcpEgressConfig>,
 }
 
 impl PackRunCmd {
@@ -413,7 +417,7 @@ impl PackRunCmd {
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: None,
-            tcp_egress: None,
+            tcp_egress: self.tcp_egress.clone(),
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
 
@@ -1325,6 +1329,7 @@ fn run_ephemeral(
                 info: false,
                 debug,
                 cuda: args.cuda,
+                tcp_egress: None,
             };
             cmd.run()
         }

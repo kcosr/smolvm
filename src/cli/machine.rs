@@ -489,7 +489,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file", "awaf_route", "awaf_tls_server_name", "awaf_tls_trust", "direct_tcp_port", "unmatched_tcp"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -990,9 +990,17 @@ impl RunCmd {
         // `--from`: run a packed .smolmachine artifact ephemerally, reusing the
         // proven pack-run path. Resource flags fall back to the artifact's baked
         // manifest values (matching `machine create --from`); the remaining run
-        // flags pass through. Flags the sidecar runner can't honor are rejected
-        // at parse time via `conflicts_with_all` on `from`.
+        // flags pass through. TCP egress is built here and handed to the packed
+        // launcher; remaining unsupported flags are rejected at parse time via
+        // `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let tcp_egress = build_tcp_egress_config(
+                &self.awaf_route,
+                &self.direct_tcp_port,
+                self.unmatched_tcp,
+                self.awaf_tls.awaf_tls_server_name.as_deref(),
+                self.awaf_tls.awaf_tls_trust.as_deref(),
+            )?;
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
                 command: self.command,
@@ -1013,6 +1021,7 @@ impl RunCmd {
                 info: false,
                 debug: false,
                 cuda: false,
+                tcp_egress,
             }
             .run();
         }
@@ -1143,6 +1152,7 @@ impl RunCmd {
                     info: false,
                     debug: false,
                     cuda: false,
+                    tcp_egress: None,
                 }
                 .run();
             }
@@ -1197,6 +1207,7 @@ impl RunCmd {
                 info: false,
                 debug: false,
                 cuda: false,
+                tcp_egress: None,
             }
             .run();
         }
@@ -2152,6 +2163,31 @@ mod tests {
             create.awaf_tls.awaf_tls_trust.as_deref(),
             Some(Path::new("/etc/smolvm/proxy-roots.pem"))
         );
+    }
+
+    #[test]
+    fn run_from_accepts_tcp_egress_flags() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--from",
+            "/tmp/base.smolmachine",
+            "--awaf-route",
+            "443=tls://127.0.0.1:7444",
+            "--awaf-tls-server-name",
+            "proxy.example.test",
+            "--awaf-tls-trust",
+            "/etc/smolvm/proxy-roots.pem",
+            "--unmatched-tcp",
+            "deny",
+        ]);
+
+        let MachineCmd::Run(run) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(run.from, Some(PathBuf::from("/tmp/base.smolmachine")));
+        assert_eq!(run.awaf_route, ["443=tls://127.0.0.1:7444"]);
+        assert_eq!(run.unmatched_tcp, Some(smolvm_network::UnmatchedTcp::Deny));
     }
 
     // Documents the clap parsing behaviour: positionals before "--" land in
