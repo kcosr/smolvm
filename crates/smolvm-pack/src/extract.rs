@@ -1862,7 +1862,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SparseCopyStrategy {
+pub(crate) enum SparseCopyStrategy {
     #[cfg(target_os = "linux")]
     Clone,
     #[cfg(target_os = "linux")]
@@ -1880,45 +1880,36 @@ enum SparseCopyStrategy {
 /// Used on both ends: the extract/run side here, and the pack-create side in
 /// `assets::create_storage_template` when it copies the pre-formatted
 /// `storage-template.ext4` into the staging directory.
-pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
-    sparse_copy_inner(src, dst).map(|_| ())
-}
-
-fn sparse_copy_inner(src: &Path, dst: &Path) -> std::io::Result<SparseCopyStrategy> {
+pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<SparseCopyStrategy> {
     let mut src_file = File::open(src)?;
-    let metadata = src_file.metadata()?;
-    let size = metadata.len();
-    #[cfg(target_os = "linux")]
-    let source_allocation = {
-        use std::os::unix::fs::MetadataExt;
-        (
-            metadata.blocks().saturating_mul(512),
-            metadata.blksize().max(4096),
-        )
-    };
-    let mut dst_file = File::create(dst)?;
-    let result = copy_sparse_file(
-        &mut src_file,
-        &mut dst_file,
-        size,
-        #[cfg(target_os = "linux")]
-        source_allocation,
-    );
-    if result.is_err() {
-        // A runtime disk is valid only after the complete copy succeeds.
-        // Drop the handle before removal for Windows compatibility, and
-        // preserve the original copy error if cleanup itself fails.
-        drop(dst_file);
-        let _ = fs::remove_file(dst);
+    let size = src_file.metadata()?.len();
+    let parent = dst
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".smolvm-sparse-copy-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Match File::create instead of tempfile's private 0o600 default. The
+        // process umask is still applied, preserving pack asset modes.
+        builder.permissions(fs::Permissions::from_mode(0o666));
     }
-    result
+    let mut temporary = builder.tempfile_in(parent)?;
+    let strategy = copy_sparse_file(&mut src_file, temporary.as_file_mut(), size)?;
+
+    // Keep an interrupted copy away from the final path. persist() atomically
+    // replaces an existing destination and cleans up the temporary file on error.
+    temporary.as_file().sync_all()?;
+    temporary.persist(dst).map_err(|error| error.error)?;
+    Ok(strategy)
 }
 
 fn copy_sparse_file(
     src_file: &mut File,
     dst_file: &mut File,
     size: u64,
-    #[cfg(target_os = "linux")] source_allocation: (u64, u64),
 ) -> std::io::Result<SparseCopyStrategy> {
     #[cfg(target_os = "linux")]
     if try_clone_file(src_file, dst_file)? {
@@ -1928,14 +1919,10 @@ fn copy_sparse_file(
     prepare_sparse_destination(dst_file, size)?;
 
     #[cfg(target_os = "linux")]
-    if try_copy_sparse_extents(src_file, dst_file, size, source_allocation)? {
+    if try_copy_sparse_extents(src_file, dst_file, size)? {
         return Ok(SparseCopyStrategy::SparseExtents);
     }
 
-    // An unsupported extent operation may have discovered support only after
-    // touching the destination. Truncating drops every allocated extent before
-    // the portable fallback starts.
-    prepare_sparse_destination(dst_file, size)?;
     copy_scanning_for_nonzero_chunks(src_file, dst_file, size)?;
     Ok(SparseCopyStrategy::Scanned)
 }
@@ -1974,15 +1961,12 @@ fn try_clone_file(src_file: &File, dst_file: &File) -> std::io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn is_unsupported_clone_errno(errno: libc::c_int) -> bool {
+    // EPERM commonly means a seccomp or LSM policy denied this optional ioctl.
+    // The destination is a newly-created temporary file, so it cannot be an
+    // immutable file; ordinary read/write permission failures remain errors.
     matches!(
         errno,
-        libc::EOPNOTSUPP
-            | libc::ENOTTY
-            | libc::EXDEV
-            | libc::EINVAL
-            | libc::ENOSYS
-            | libc::EPERM
-            | libc::EACCES
+        libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::EPERM
     )
 }
 
@@ -1991,12 +1975,13 @@ fn try_copy_sparse_extents(
     src_file: &mut File,
     dst_file: &mut File,
     size: u64,
-    source_allocation: (u64, u64),
 ) -> std::io::Result<bool> {
     if size == 0 {
         return Ok(true);
     }
 
+    // This function must not modify dst_file before it knows the extent path is
+    // usable. Ok(false) lets the caller safely start the scanner without reset.
     // Linux has no _PC_MIN_HOLE_SIZE capability query. Probe SEEK_HOLE before
     // writing anything so unsupported filesystems can use the scanner cleanly.
     match linux_lseek(src_file, 0, libc::SEEK_HOLE) {
@@ -2008,13 +1993,19 @@ fn try_copy_sparse_extents(
     let Some(extents) = collect_sparse_extents(src_file, size)? else {
         return Ok(false);
     };
+    use std::os::unix::fs::MetadataExt;
+    let metadata = src_file.metadata()?;
+    let source_allocation = (
+        metadata.blocks().saturating_mul(512),
+        metadata.blksize().max(4096),
+    );
     if !extent_map_preserves_sparseness(size, source_allocation, &extents)? {
         return Ok(false);
     }
 
     let mut buffer = vec![0u8; 1024 * 1024];
     for (start, end) in extents {
-        copy_file_range_buffered(src_file, dst_file, start, end, &mut buffer)?;
+        copy_byte_range_buffered(src_file, dst_file, start, end, &mut buffer)?;
     }
     if src_file.metadata()?.len() != size {
         return Err(std::io::Error::new(
@@ -2089,6 +2080,8 @@ fn extent_map_preserves_sparseness(
     // Linux permits a minimal SEEK_DATA/SEEK_HOLE implementation that reports
     // the entire file as data. Do not let that densify a source whose st_blocks
     // proves it is sparse. One allocation unit accounts for extent rounding.
+    // Compression can make st_blocks smaller than accurate logical extents; in
+    // that case this deliberately chooses the slower scanner for correctness.
     Ok(allocated_bytes >= size
         || reported_data_bytes <= allocated_bytes.saturating_add(allocation_unit))
 }
@@ -2118,7 +2111,7 @@ fn is_unsupported_seek_error(error: &std::io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_file_range_buffered(
+fn copy_byte_range_buffered(
     src_file: &mut File,
     dst_file: &mut File,
     start: u64,
@@ -2849,18 +2842,7 @@ mod tests {
         let mut source_file = File::open(&source).unwrap();
         let mut destination_file = File::create(&destination).unwrap();
         prepare_sparse_destination(&destination_file, logical_size).unwrap();
-        let source_metadata = fs::metadata(&source).unwrap();
-        let source_allocation = (
-            source_metadata.blocks().saturating_mul(512),
-            source_metadata.blksize().max(4096),
-        );
-        if !try_copy_sparse_extents(
-            &mut source_file,
-            &mut destination_file,
-            logical_size,
-            source_allocation,
-        )
-        .unwrap()
+        if !try_copy_sparse_extents(&mut source_file, &mut destination_file, logical_size).unwrap()
         {
             eprintln!("skipping: test filesystem does not support SEEK_DATA/SEEK_HOLE");
             return;
@@ -2874,6 +2856,134 @@ mod tests {
             allocated_bytes < 4 * 1024 * 1024,
             "extent copy densified destination: {allocated_bytes} bytes allocated"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sparse_clone_preserves_contents_and_independence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        {
+            let mut file = File::create(&source).unwrap();
+            file.write_all(b"source").unwrap();
+            file.set_len(16 * 1024 * 1024).unwrap();
+        }
+
+        let source_file = File::open(&source).unwrap();
+        let destination_file = File::create(&destination).unwrap();
+        if !try_clone_file(&source_file, &destination_file).unwrap() {
+            eprintln!("skipping: test filesystem does not support FICLONE");
+            return;
+        }
+        drop(source_file);
+        drop(destination_file);
+
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .unwrap()
+            .write_all(b"target")
+            .unwrap();
+        assert_eq!(&fs::read(&source).unwrap()[..6], b"source");
+    }
+
+    #[test]
+    fn test_sparse_copy_preserves_full_contents_and_length() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let logical_size = 4 * 1024 * 1024;
+        {
+            let mut file = File::create(&source).unwrap();
+            file.set_len(logical_size).unwrap();
+            file.seek(SeekFrom::Start(17)).unwrap();
+            file.write_all(b"start").unwrap();
+            file.seek(SeekFrom::Start(2 * 1024 * 1024 + 31)).unwrap();
+            file.write_all(b"middle").unwrap();
+            file.seek(SeekFrom::Start(logical_size - 4)).unwrap();
+            file.write_all(b"tail").unwrap();
+        }
+
+        let strategy = sparse_copy(&source, &destination).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let _ = strategy;
+
+        assert_eq!(fs::metadata(&destination).unwrap().len(), logical_size);
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+
+        #[cfg(target_os = "linux")]
+        {
+            let probe = temp_dir.path().join("extent-probe.raw");
+            let mut source_file = File::open(&source).unwrap();
+            let mut probe_file = File::create(&probe).unwrap();
+            prepare_sparse_destination(&probe_file, logical_size).unwrap();
+            let extents_supported =
+                try_copy_sparse_extents(&mut source_file, &mut probe_file, logical_size).unwrap();
+            if extents_supported {
+                assert_ne!(strategy, SparseCopyStrategy::Scanned);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_copy_preserves_empty_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        File::create(&source).unwrap();
+
+        sparse_copy(&source, &destination).unwrap();
+
+        assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sparse_copy_uses_normal_created_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let reference = temp_dir.path().join("reference.raw");
+        fs::write(&source, b"contents").unwrap();
+        File::create(&reference).unwrap();
+        let expected_mode = fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+
+        sparse_copy(&source, &destination).unwrap();
+
+        let actual_mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(actual_mode, expected_mode);
+    }
+
+    #[test]
+    fn test_sparse_copy_preserves_all_hole_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let logical_size = 16 * 1024 * 1024;
+        File::create(&source)
+            .unwrap()
+            .set_len(logical_size)
+            .unwrap();
+
+        sparse_copy(&source, &destination).unwrap();
+
+        assert_eq!(fs::metadata(&destination).unwrap().len(), logical_size);
+        assert!(fs::read(&destination)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert!(
+                fs::metadata(&destination).unwrap().blocks() * 512 < 1024 * 1024,
+                "all-hole destination was densified"
+            );
+        }
     }
 
     #[test]
@@ -2955,10 +3065,10 @@ mod tests {
             libc::EINVAL,
             libc::ENOSYS,
             libc::EPERM,
-            libc::EACCES,
         ] {
             assert!(is_unsupported_clone_errno(errno));
         }
+        assert!(!is_unsupported_clone_errno(libc::EACCES));
         assert!(!is_unsupported_clone_errno(libc::ENOSPC));
         assert!(!is_unsupported_clone_errno(libc::EBADF));
     }
