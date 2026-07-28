@@ -1952,7 +1952,62 @@ fn prepare_sparse_destination(dst_file: &File, size: u64) -> std::io::Result<()>
     // first. Unix filesystems are sparse by default.
     #[cfg(windows)]
     mark_file_sparse(dst_file)?;
+    // On APFS, growing the file before scattered writes can eagerly allocate
+    // the intervening zero ranges. Leave it empty while copying; the extent and
+    // scanner paths set the final length and explicitly punch known holes.
+    #[cfg(not(target_os = "macos"))]
     dst_file.set_len(size)?;
+    #[cfg(target_os = "macos")]
+    let _ = size;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn punch_macos_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let punch = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: i64::try_from(offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse hole offset does not fit off_t",
+            )
+        })?,
+        fp_length: i64::try_from(length).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse hole length does not fit off_t",
+            )
+        })?,
+    };
+    loop {
+        let result =
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &punch as *const _) };
+        if result != -1 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn punch_macos_extent_holes(file: &File, size: u64, extents: &[(u64, u64)]) -> std::io::Result<()> {
+    let mut cursor = 0;
+    for &(start, end) in extents {
+        if start > cursor {
+            punch_macos_hole(file, cursor, start - cursor)?;
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < size {
+        punch_macos_hole(file, cursor, size - cursor)?;
+    }
     Ok(())
 }
 
@@ -2090,7 +2145,7 @@ fn try_copy_sparse_extents(
     }
 
     let mut buffer = vec![0u8; 1024 * 1024];
-    for (start, end) in extents {
+    for &(start, end) in &extents {
         copy_byte_range_buffered(src_file, dst_file, start, end, &mut buffer)?;
     }
     if src_file.metadata()?.len() != size {
@@ -2099,6 +2154,11 @@ fn try_copy_sparse_extents(
             "source file size changed during sparse copy",
         ));
     }
+    dst_file.set_len(size)?;
+    // APFS can allocate the gaps when later extents are written beyond EOF,
+    // even though SEEK_DATA/SEEK_HOLE correctly identified them as holes.
+    #[cfg(target_os = "macos")]
+    punch_macos_extent_holes(dst_file, size, &extents)?;
 
     Ok(true)
 }
@@ -2437,6 +2497,8 @@ fn copy_scanning_for_nonzero_chunks(
     size: u64,
 ) -> std::io::Result<()> {
     src_file.seek(SeekFrom::Start(0))?;
+    #[cfg(target_os = "macos")]
+    let mut zero_ranges = Vec::new();
 
     // Forward pass: read in 512 KiB chunks, writing only chunks that contain a
     // non-zero byte. Zero chunks are skipped, so they stay as holes in `dst`.
@@ -2452,9 +2514,22 @@ fn copy_scanning_for_nonzero_chunks(
             ));
         }
         let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
+        let has_nonzero = chunk.iter().any(|&b| b != 0);
+        if has_nonzero {
             dst_file.seek(SeekFrom::Start(offset))?;
             dst_file.write_all(chunk)?;
+        }
+        #[cfg(target_os = "macos")]
+        if !has_nonzero {
+            if let Some((_, end)) = zero_ranges.last_mut() {
+                if *end == offset {
+                    *end += n as u64;
+                } else {
+                    zero_ranges.push((offset, offset + n as u64));
+                }
+            } else {
+                zero_ranges.push((offset, offset + n as u64));
+            }
         }
         offset += n as u64;
     }
@@ -2464,6 +2539,11 @@ fn copy_scanning_for_nonzero_chunks(
             std::io::ErrorKind::UnexpectedEof,
             "source file size changed during scanning sparse copy",
         ));
+    }
+    dst_file.set_len(size)?;
+    #[cfg(target_os = "macos")]
+    for (start, end) in zero_ranges {
+        punch_macos_hole(dst_file, start, end - start)?;
     }
     Ok(())
 }
@@ -2592,6 +2672,50 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn unix_allocated_bytes(path: &Path) -> std::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(fs::metadata(path)?.blocks() * 512)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn punch_macos_fixture_holes(
+        file: &mut File,
+        logical_size: u64,
+        markers: &[(u64, &[u8])],
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        file.flush()?;
+        let allocation_unit = file.metadata()?.blksize().max(4096);
+        let mut retained_until = 0;
+
+        for &(offset, data) in markers {
+            let retained_start = offset / allocation_unit * allocation_unit;
+            if retained_start > retained_until {
+                punch_macos_hole(file, retained_until, retained_start - retained_until)?;
+            }
+
+            let data_end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sparse test marker offset overflowed",
+                )
+            })?;
+            let retained_end = data_end
+                .div_ceil(allocation_unit)
+                .saturating_mul(allocation_unit)
+                .min(logical_size);
+            retained_until = retained_until.max(retained_end);
+        }
+
+        if retained_until < logical_size {
+            punch_macos_hole(file, retained_until, logical_size - retained_until)?;
+        }
+        Ok(())
+    }
 
     #[cfg(windows)]
     fn windows_allocated_bytes(path: &Path) -> std::io::Result<u64> {
@@ -3150,20 +3274,32 @@ mod tests {
         let source = temp_dir.path().join("source.raw");
         let destination = temp_dir.path().join("destination.raw");
         let logical_size = 32 * 1024 * 1024;
+        let markers = [
+            (0, b"start".as_slice()),
+            (1024 * 1024 - 2, b"cross-buffer".as_slice()),
+            (17 * 1024 * 1024 + 123, b"middle".as_slice()),
+            (logical_size - 4, b"tail".as_slice()),
+        ];
         {
             let mut file = File::create(&source).unwrap();
             #[cfg(windows)]
             mark_file_sparse(&file).unwrap();
             file.set_len(logical_size).unwrap();
-            for (offset, data) in [
-                (0, b"start".as_slice()),
-                (1024 * 1024 - 2, b"cross-buffer".as_slice()),
-                (17 * 1024 * 1024 + 123, b"middle".as_slice()),
-                (logical_size - 4, b"tail".as_slice()),
-            ] {
+            for &(offset, data) in &markers {
                 file.seek(SeekFrom::Start(offset)).unwrap();
                 file.write_all(data).unwrap();
             }
+            #[cfg(target_os = "macos")]
+            punch_macos_fixture_holes(&mut file, logical_size, &markers).unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            let allocated_bytes = unix_allocated_bytes(&source).unwrap();
+            assert!(
+                allocated_bytes < 4 * 1024 * 1024,
+                "sparse test fixture is dense: {allocated_bytes} bytes allocated"
+            );
         }
 
         let mut source_file = File::open(&source).unwrap();
@@ -3180,8 +3316,7 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let allocated_bytes = fs::metadata(&destination).unwrap().blocks() * 512;
+            let allocated_bytes = unix_allocated_bytes(&destination).unwrap();
             assert!(
                 allocated_bytes < 4 * 1024 * 1024,
                 "extent copy densified destination: {allocated_bytes} bytes allocated"
@@ -3461,24 +3596,35 @@ mod tests {
         let source = source_dir.join(format!("smolvm-sparse-source-{suffix}.raw"));
         let destination = destination_dir.join(format!("smolvm-sparse-destination-{suffix}.raw"));
         let logical_size = 64 * 1024 * 1024;
+        let markers = [
+            (0, b"start".as_slice()),
+            (7 * 1024 * 1024 + 13, b"middle".as_slice()),
+            (logical_size - 4, b"tail".as_slice()),
+        ];
         {
             let mut file = File::create(&source).unwrap();
             #[cfg(windows)]
             mark_file_sparse(&file).unwrap();
             file.set_len(logical_size).unwrap();
-            for (offset, data) in [
-                (0, b"start".as_slice()),
-                (7 * 1024 * 1024 + 13, b"middle".as_slice()),
-                (logical_size - 4, b"tail".as_slice()),
-            ] {
+            for &(offset, data) in &markers {
                 file.seek(SeekFrom::Start(offset)).unwrap();
                 file.write_all(data).unwrap();
             }
+            #[cfg(target_os = "macos")]
+            punch_macos_fixture_holes(&mut file, logical_size, &markers).unwrap();
         }
 
         let strategy = sparse_copy(&source, &destination).unwrap();
         eprintln!("selected sparse-copy strategy: {strategy:?}");
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        #[cfg(unix)]
+        {
+            let allocated_bytes = unix_allocated_bytes(&destination).unwrap();
+            assert!(
+                allocated_bytes < 4 * 1024 * 1024,
+                "host-directory copy densified destination: {allocated_bytes} bytes allocated"
+            );
+        }
         #[cfg(windows)]
         {
             let allocated_bytes = windows_allocated_bytes(&destination).unwrap();
@@ -3557,6 +3703,11 @@ mod tests {
         drop(destination_file);
 
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        #[cfg(unix)]
+        assert!(
+            unix_allocated_bytes(&destination).unwrap() < 2 * 1024 * 1024,
+            "scanning fallback densified destination"
+        );
     }
 
     #[cfg(target_os = "linux")]
