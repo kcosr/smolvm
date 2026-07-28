@@ -1964,6 +1964,7 @@ fn try_clone_file_to_destination(
 ) -> std::io::Result<bool> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
 
     // fclonefileat creates its destination and fails if it already exists. Use
     // tempfile only to reserve a random same-directory name, then remove the
@@ -1994,12 +1995,21 @@ fn try_clone_file_to_destination(
     }
 
     // clonefile copies source metadata. Restore normal created-file permissions
-    // so runtime disks remain writable and packed asset modes stay deterministic.
-    fs::set_permissions(&temporary_path, permissions)?;
+    // through the cloned file descriptor so a replaced path is never followed.
     let cloned = fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&temporary_path)?;
+    let chmod_result = unsafe {
+        libc::fchmod(
+            cloned.as_raw_fd(),
+            (permissions.mode() & 0o7777) as libc::mode_t,
+        )
+    };
+    if chmod_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     cloned.sync_all()?;
     drop(cloned);
     temporary_path.persist(dst).map_err(|error| error.error)?;
@@ -2008,7 +2018,10 @@ fn try_clone_file_to_destination(
 
 #[cfg(target_os = "macos")]
 fn is_unsupported_macos_clone_errno(errno: libc::c_int) -> bool {
-    matches!(errno, libc::ENOTSUP | libc::EXDEV | libc::ENOSYS)
+    matches!(
+        errno,
+        libc::ENOTSUP | libc::EXDEV | libc::ENOSYS | libc::EPERM | libc::EACCES
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -2102,10 +2115,7 @@ fn collect_sparse_extents(src_file: &File, size: u64) -> std::io::Result<Option<
             Err(error) => return Err(error),
         };
         if data_offset < offset || data_offset >= size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SEEK_DATA returned an invalid sparse-file offset",
-            ));
+            return Ok(None);
         }
 
         let hole_offset = match sparse_lseek(src_file, data_offset, libc::SEEK_HOLE) {
@@ -2114,10 +2124,7 @@ fn collect_sparse_extents(src_file: &File, size: u64) -> std::io::Result<Option<
             Err(error) => return Err(error),
         };
         if hole_offset <= data_offset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SEEK_HOLE did not advance past the data extent",
-            ));
+            return Ok(None);
         }
 
         let extent_end = hole_offset.min(size);
@@ -2282,13 +2289,15 @@ fn try_clone_file(src_file: &File, dst_file: &File, size: u64) -> std::io::Resul
 #[cfg(windows)]
 fn is_unsupported_windows_clone_error(error: &std::io::Error) -> bool {
     use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+        ERROR_BLOCK_TOO_MANY_REFERENCES, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
     };
 
     error.raw_os_error().is_some_and(|errno| {
         matches!(
             errno as u32,
-            ERROR_INVALID_FUNCTION
+            ERROR_BLOCK_TOO_MANY_REFERENCES
+                | ERROR_INVALID_FUNCTION
                 | ERROR_INVALID_PARAMETER
                 | ERROR_NOT_SAME_DEVICE
                 | ERROR_NOT_SUPPORTED
@@ -2450,6 +2459,12 @@ fn copy_scanning_for_nonzero_chunks(
         offset += n as u64;
     }
 
+    if src_file.metadata()?.len() != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source file size changed during scanning sparse copy",
+        ));
+    }
     Ok(())
 }
 
@@ -2577,6 +2592,34 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn windows_allocated_bytes(path: &Path) -> std::io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+        };
+
+        let file = File::open(path)?;
+        let mut info = FILE_STANDARD_INFO::default();
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStandardInfo,
+                (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        u64::try_from(info.AllocationSize).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows returned a negative file allocation size",
+            )
+        })
+    }
 
     /// Build a single-file tar archive in memory with the given name and data.
     fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
@@ -3109,6 +3152,8 @@ mod tests {
         let logical_size = 32 * 1024 * 1024;
         {
             let mut file = File::create(&source).unwrap();
+            #[cfg(windows)]
+            mark_file_sparse(&file).unwrap();
             file.set_len(logical_size).unwrap();
             for (offset, data) in [
                 (0, b"start".as_slice()),
@@ -3137,6 +3182,14 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
             let allocated_bytes = fs::metadata(&destination).unwrap().blocks() * 512;
+            assert!(
+                allocated_bytes < 4 * 1024 * 1024,
+                "extent copy densified destination: {allocated_bytes} bytes allocated"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let allocated_bytes = windows_allocated_bytes(&destination).unwrap();
             assert!(
                 allocated_bytes < 4 * 1024 * 1024,
                 "extent copy densified destination: {allocated_bytes} bytes allocated"
@@ -3234,6 +3287,66 @@ mod tests {
             .write_all(b"target")
             .unwrap();
         assert_eq!(&fs::read(&source).unwrap()[..6], b"source");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a ReFS temporary directory"]
+    fn test_windows_block_clone_spans_multiple_operations() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let logical_size = 5 * 1024 * 1024 * 1024u64;
+        let clone_boundary = 4 * 1024 * 1024 * 1024u64 - 64 * 1024;
+        let markers = [
+            (0, b"start".as_slice()),
+            (clone_boundary - 64, b"before-boundary".as_slice()),
+            (clone_boundary - 8, b"across-boundary".as_slice()),
+            (clone_boundary + 64, b"after-boundary".as_slice()),
+            (logical_size - 4, b"tail".as_slice()),
+        ];
+        {
+            let mut file = File::create(&source).unwrap();
+            mark_file_sparse(&file).unwrap();
+            file.set_len(logical_size).unwrap();
+            for (offset, data) in markers {
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(data).unwrap();
+            }
+        }
+
+        let strategy = sparse_copy(&source, &destination).unwrap();
+        assert_eq!(
+            strategy,
+            SparseCopyStrategy::Clone,
+            "ReFS did not select block cloning"
+        );
+        assert_eq!(fs::metadata(&destination).unwrap().len(), logical_size);
+        let mut destination_file = File::open(&destination).unwrap();
+        for (offset, expected) in markers {
+            let mut actual = vec![0u8; expected.len()];
+            destination_file.seek(SeekFrom::Start(offset)).unwrap();
+            destination_file.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        let allocated_bytes = windows_allocated_bytes(&destination).unwrap();
+        assert!(
+            allocated_bytes < 16 * 1024 * 1024,
+            "multi-operation clone densified destination: {allocated_bytes} bytes allocated"
+        );
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .unwrap()
+            .write_all(b"target")
+            .unwrap();
+        let mut source_prefix = [0u8; 5];
+        File::open(&source)
+            .unwrap()
+            .read_exact(&mut source_prefix)
+            .unwrap();
+        assert_eq!(&source_prefix, b"start");
     }
 
     #[test]
@@ -3366,6 +3479,14 @@ mod tests {
         let strategy = sparse_copy(&source, &destination).unwrap();
         eprintln!("selected sparse-copy strategy: {strategy:?}");
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        #[cfg(windows)]
+        {
+            let allocated_bytes = windows_allocated_bytes(&destination).unwrap();
+            assert!(
+                allocated_bytes < 4 * 1024 * 1024,
+                "host-directory copy densified destination: {allocated_bytes} bytes allocated"
+            );
+        }
 
         if let Ok(expected) = std::env::var("SMOLVM_EXPECT_SPARSE_STRATEGY") {
             let matches = match expected.as_str() {
@@ -3476,10 +3597,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_clone_fallback_errno_classification() {
-        for errno in [libc::ENOTSUP, libc::EXDEV, libc::ENOSYS] {
+        for errno in [
+            libc::ENOTSUP,
+            libc::EXDEV,
+            libc::ENOSYS,
+            libc::EPERM,
+            libc::EACCES,
+        ] {
             assert!(is_unsupported_macos_clone_errno(errno));
         }
-        assert!(!is_unsupported_macos_clone_errno(libc::EACCES));
         assert!(!is_unsupported_macos_clone_errno(libc::ENOSPC));
     }
 
@@ -3487,11 +3613,13 @@ mod tests {
     #[test]
     fn test_windows_clone_fallback_error_classification() {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
-            ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+            ERROR_ACCESS_DENIED, ERROR_BLOCK_TOO_MANY_REFERENCES, ERROR_DISK_FULL,
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SAME_DEVICE,
+            ERROR_NOT_SUPPORTED,
         };
 
         for error in [
+            ERROR_BLOCK_TOO_MANY_REFERENCES,
             ERROR_INVALID_FUNCTION,
             ERROR_INVALID_PARAMETER,
             ERROR_NOT_SAME_DEVICE,
@@ -3514,18 +3642,27 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("source.raw");
         let destination = temp_dir.path().join("destination.raw");
-        let logical_size = 6 * 1024 * 1024;
+        let logical_size = 40 * 1024 * 1024;
+        let marker_spacing = 128 * 1024;
         {
             let mut file = File::create(&source).unwrap();
             mark_file_sparse(&file).unwrap();
             file.set_len(logical_size).unwrap();
-            for offset in (0..logical_size).step_by(16 * 1024) {
+            for offset in (0..logical_size).step_by(marker_spacing) {
                 file.seek(SeekFrom::Start(offset)).unwrap();
                 file.write_all(b"x").unwrap();
             }
         }
 
         let mut source_file = File::open(&source).unwrap();
+        let extents = collect_windows_allocated_ranges(&source_file, logical_size)
+            .unwrap()
+            .expect("test filesystem does not support allocated-range queries");
+        assert!(
+            extents.len() > 256,
+            "test layout produced only {} allocated ranges",
+            extents.len()
+        );
         let mut destination_file = File::create(&destination).unwrap();
         prepare_sparse_destination(&destination_file, logical_size).unwrap();
         if !try_copy_sparse_extents(&mut source_file, &mut destination_file, logical_size).unwrap()
@@ -3537,6 +3674,11 @@ mod tests {
         drop(destination_file);
 
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        let allocated_bytes = windows_allocated_bytes(&destination).unwrap();
+        assert!(
+            allocated_bytes < 32 * 1024 * 1024,
+            "allocated-range copy densified destination: {allocated_bytes} bytes allocated"
+        );
     }
 
     #[test]
