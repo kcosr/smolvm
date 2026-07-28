@@ -56,6 +56,11 @@ const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
 /// socket-probe grace, regressing boot time from ~hundreds of ms to ~5 s.
 const ROOTFS_DAX_WINDOW: u64 = 1 << 29;
 
+/// Packed OCI layers and flattened rootfs trees are read-heavy and can contain
+/// many small files. Match packed mode's 2 GiB virtual DAX window; pages are
+/// committed on demand, so this does not reserve 2 GiB of host RAM per VM.
+const PACKED_LAYERS_DAX_WINDOW: u64 = 1 << 31;
+
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
 
@@ -1525,11 +1530,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if layers_dir.exists() {
                 let tag = cstr("smolvm_layers");
                 let host_path = path_to_cstring(layers_dir)?;
-                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add packed layers virtiofs",
-                        "krun_add_virtiofs failed for packed layers",
+                        "read-only packed layers require libkrun with krun_add_virtiofs3",
+                    ));
+                };
+                if add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    PACKED_LAYERS_DAX_WINDOW,
+                    true,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add packed layers virtiofs",
+                        "krun_add_virtiofs3 failed for read-only packed layers",
                     ));
                 }
             } else {

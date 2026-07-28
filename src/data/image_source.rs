@@ -187,10 +187,113 @@ fn resolve_directory(path: &Path) -> Result<ResolvedImage> {
             format!("{} is not a directory", canonical.display()),
         ));
     }
+    if !["bin", "usr", "etc", "sbin"]
+        .iter()
+        .any(|name| canonical.join(name).is_dir())
+    {
+        return Err(Error::config(
+            "--image",
+            format!(
+                "{} does not look like a Linux rootfs (expected at least one of bin, usr, etc, or sbin)",
+                canonical.display()
+            ),
+        ));
+    }
     Ok(ResolvedImage::Local {
         reference: format!("{LOCAL_DIR_PREFIX}{}", canonical.display()),
         packed_layers_dir: canonical,
     })
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_rootfs_uid_ownership(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Mutex, OnceLock};
+
+    // The API's privileged serve mode drops each VMM to one dedicated host uid
+    // and presents this tree through a single-entry idmapped mount. A mixed-owner
+    // tree cannot be represented faithfully by that isolation model: entries
+    // outside the one mapped uid/gid become overflow IDs and restrictive files
+    // become unreadable. This validation is called only by the API rootfs path;
+    // direct CLI mounts do not use the idmap and retain their existing behavior.
+    let expected_uid = unsafe { libc::geteuid() };
+    if root.parent().is_none() {
+        return Err(Error::config(
+            "source.path",
+            "the host filesystem root cannot be used as a rootfs source",
+        ));
+    }
+
+    // A root-owned source can only be re-owned by another privileged host
+    // process. Treat root as the trust boundary and avoid walking a large
+    // immutable base again on every start, supervisor restart, or later VM that
+    // shares it. API create primes this cache; persisted local-dir records
+    // created elsewhere are checked on their first UID-dropped API launch.
+    static VALIDATED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let validated = VALIDATED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if validated
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(root)
+    {
+        return Ok(());
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
+            Error::config(
+                "--image",
+                format!("cannot inspect rootfs entry {}: {}", path.display(), e),
+            )
+        })?;
+        if metadata.uid() != expected_uid {
+            return Err(Error::config(
+                "source.path",
+                format!(
+                    "rootfs entry {} is owned by uid {}, but every entry must be owned by the smolvm server uid {} for per-VM uid isolation",
+                    path.display(),
+                    metadata.uid(),
+                    expected_uid
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            let entries = std::fs::read_dir(&path).map_err(|e| {
+                Error::config(
+                    "source.path",
+                    format!("cannot read rootfs directory {}: {}", path.display(), e),
+                )
+            })?;
+            for entry in entries {
+                pending.push(
+                    entry
+                        .map_err(|e| {
+                            Error::config(
+                                "source.path",
+                                format!(
+                                    "cannot enumerate rootfs directory {}: {}",
+                                    path.display(),
+                                    e
+                                ),
+                            )
+                        })?
+                        .path(),
+                );
+            }
+        }
+    }
+    validated
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root.to_path_buf());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn validate_rootfs_uid_ownership(_root: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn resolve_archive(input: ArchiveInput) -> Result<ResolvedImage> {
@@ -307,6 +410,12 @@ const LOCAL_DIR_PREFIX: &str = "local-dir:";
 /// [`resolve`]) rather than a registry.
 pub fn is_local_ref(reference: &str) -> bool {
     reference.starts_with(LOCAL_ARCHIVE_PREFIX) || reference.starts_with(LOCAL_DIR_PREFIX)
+}
+
+/// Whether a persisted image reference points directly at an unpacked host
+/// rootfs directory.
+pub fn is_local_dir_ref(reference: &str) -> bool {
+    reference.starts_with(LOCAL_DIR_PREFIX)
 }
 
 /// Map a persisted `local:…`/`local-dir:…` reference back to the host directory
@@ -484,6 +593,7 @@ mod tests {
     #[test]
     fn resolve_directory_yields_local_with_the_dir() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("usr")).unwrap();
         match resolve_directory(dir.path()).unwrap() {
             ResolvedImage::Local {
                 reference,
@@ -494,5 +604,41 @@ mod tests {
             }
             other => panic!("expected Local, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_directory_rejects_non_rootfs_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_directory(dir.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not look like a Linux rootfs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_ownership_validation_rejects_host_root_without_walking_it() {
+        let err = validate_rootfs_uid_ownership(Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("host filesystem root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_ownership_validation_accepts_and_caches_uniform_tree() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::create_dir(rootfs.join("bin")).unwrap();
+        std::fs::write(rootfs.join("bin/tool"), b"test").unwrap();
+        let rootfs = rootfs.canonicalize().unwrap();
+
+        validate_rootfs_uid_ownership(&rootfs).unwrap();
+
+        // Move the tree aside temporarily. A second validation can only
+        // succeed if the canonical source path was cached after the first walk.
+        let moved = base.path().join("rootfs-moved");
+        std::fs::rename(&rootfs, &moved).unwrap();
+        validate_rootfs_uid_ownership(&rootfs).unwrap();
+        std::fs::rename(moved, rootfs).unwrap();
     }
 }

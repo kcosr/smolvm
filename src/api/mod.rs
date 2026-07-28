@@ -94,6 +94,7 @@ use state::ApiState;
     components(schemas(
         // Request types
         types::CreateMachineRequest,
+        types::MachineSource,
         types::RestartSpec,
         types::MountSpec,
         types::PortSpec,

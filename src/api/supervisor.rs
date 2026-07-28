@@ -288,6 +288,7 @@ impl Supervisor {
         let ports = record.port_mappings();
         let resources = record.vm_resources();
         let source_smolmachine = record.source_smolmachine.clone();
+        let source_image = record.image.clone();
         let dns_filter_hosts = record.dns_filter_hosts.clone();
         let name_for_features = name.to_string();
 
@@ -298,6 +299,7 @@ impl Supervisor {
             let features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
+                source_image.as_deref(),
                 dns_filter_hosts,
             )?;
             entry
@@ -320,6 +322,19 @@ impl Supervisor {
                     .update_machine_state(name, RecordState::Running, pid)
                 {
                     tracing::warn!(machine = %name, error = %e, "failed to persist running state");
+                }
+                // A restarted image VM has only its agent after boot. Restore
+                // the configured workload just as explicit and implicit starts
+                // do; keep this best-effort so a workload failure does not turn
+                // a healthy VM restart into a failed restart.
+                if let Err(e) =
+                    crate::api::state::relaunch_image_workload(&self.state, name, &entry).await
+                {
+                    tracing::warn!(
+                        machine = %name,
+                        error = ?e,
+                        "failed to relaunch image workload after supervisor restart; VM is up but its server is not running"
+                    );
                 }
                 tracing::info!(machine = %name, pid = ?pid, "machine restarted successfully");
                 Ok(())

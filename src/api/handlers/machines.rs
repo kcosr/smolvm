@@ -37,8 +37,8 @@ use crate::api::state::{
 };
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MachineSource, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -168,6 +168,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         },
         restart: record.restart.clone(),
         network: record.network,
+        image: record.image.clone(),
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
     }
@@ -302,20 +303,8 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Validate: registry_ref, from, and image are mutually exclusive
-    let source_count = [
-        req.registry_ref.is_some(),
-        req.from.is_some(),
-        req.image.is_some(),
-    ]
-    .iter()
-    .filter(|&&b| b)
-    .count();
-    if source_count > 1 {
-        return Err(ApiError::BadRequest(
-            "'registryRef', 'from', and 'image' are mutually exclusive".to_string(),
-        ));
-    }
+    // Validate all machine source forms before resolving any of them.
+    validate_create_source_request(&req).map_err(ApiError::BadRequest)?;
 
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
@@ -331,8 +320,39 @@ pub async fn create_machine(
         ));
     }
 
-    // If registry_ref is set, pull the artifact from the registry and treat as `from`
+    // Resolve a typed rootfs source to the same stable local-dir reference used
+    // by the CLI. The canonical host directory remains the shared overlay lower;
+    // no rootfs bytes are copied into the machine record or private data dir.
     let mut req = req;
+    if let Some(MachineSource::Rootfs { path }) = req.source.clone() {
+        let rootfs = std::path::PathBuf::from(&path);
+        let resolved = tokio::task::spawn_blocking(move || {
+            let resolved = crate::data::image_source::resolve(
+                crate::data::image_source::ImageSource::Directory(rootfs),
+            )?;
+            if let crate::data::image_source::ResolvedImage::Local {
+                ref packed_layers_dir,
+                ..
+            } = resolved
+            {
+                if crate::process::vm_uid_drop_active() {
+                    crate::data::image_source::validate_rootfs_uid_ownership(packed_layers_dir)?;
+                }
+            }
+            Ok::<_, crate::Error>(resolved)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("rootfs resolution task: {e}")))?
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let crate::data::image_source::ResolvedImage::Local { reference, .. } = resolved else {
+            return Err(ApiError::internal(
+                "rootfs source unexpectedly resolved as a registry image",
+            ));
+        };
+        req.image = Some(reference);
+    }
+
+    // If registry_ref is set, pull the artifact from the registry and treat as `from`
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(
             registry_ref,
@@ -350,7 +370,11 @@ pub async fn create_machine(
     // OCI puller would unpack its multi-GiB storage.ext4 into the guest disk.
     // Probe the manifest on the host and reroute through the same from-sidecar
     // flow as `registryRef`; a failed probe falls back to the in-guest pull.
-    if let Some(image) = req.image.clone() {
+    if let Some(image) = req
+        .image
+        .clone()
+        .filter(|image| !crate::data::image_source::is_local_ref(image))
+    {
         let sidecar = crate::data::pack_ref::resolve_pack_ref(
             &image,
             req.registry_identity_token.as_deref(),
@@ -895,6 +919,64 @@ fn validate_workload_image_source(
     Ok(())
 }
 
+/// The API's untyped `image` field is registry-only. Reject only explicit host
+/// inputs here rather than reusing the CLI classifier: suffixes such as `.tar`
+/// are valid OCI tag/name text (for example `repo:release.tar`) but the CLI also
+/// uses them as a convenience signal for local archives.
+fn validate_api_image_reference(image: &str) -> Result<(), String> {
+    let path = std::path::Path::new(image);
+    let explicit_relative_path = image.starts_with("./")
+        || image.starts_with("../")
+        || image.starts_with(".\\")
+        || image.starts_with("..\\");
+    if crate::data::image_source::is_local_ref(image)
+        || image == "-"
+        || path.is_absolute()
+        || explicit_relative_path
+    {
+        return Err("API 'image' accepts registry references only; use \
+             source.type='rootfs' for an unpacked host rootfs"
+            .to_string());
+    }
+    Ok(())
+}
+
+fn validate_create_source_request(req: &CreateMachineRequest) -> Result<(), String> {
+    let source_count = [
+        req.registry_ref.is_some(),
+        req.from.is_some(),
+        req.image.is_some(),
+        req.source.is_some(),
+    ]
+    .iter()
+    .filter(|&&present| present)
+    .count();
+    if source_count > 1 {
+        return Err(
+            "'registryRef', 'from', 'image', and 'source' are mutually exclusive".to_string(),
+        );
+    }
+    if let Some(image) = req.image.as_deref() {
+        validate_api_image_reference(image)?;
+    }
+    if let Some(MachineSource::Rootfs { path }) = req.source.as_ref() {
+        let rootfs = std::path::Path::new(path);
+        if !rootfs.is_absolute() {
+            return Err(format!(
+                "rootfs source path must be absolute: {}",
+                rootfs.display()
+            ));
+        }
+        if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            return Err(
+                "a rootfs source has no OCI entrypoint metadata; provide 'entrypoint' or 'cmd'"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Start a machine.
 #[utoipa::path(
     post,
@@ -999,6 +1081,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let source_image = record.image.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
     let forkable = query.forkable;
@@ -1010,6 +1093,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            source_image.as_deref(),
             dns_filter_hosts,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
@@ -1081,6 +1165,7 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
+        let image_is_local = crate::data::image_source::is_local_ref(&image_pull);
         // Caller-supplied credentials win over the node's own registry config:
         // that config is operator-level and shared by every tenant, so it can
         // never hold a customer's private-registry password. `PullOptions::auth`
@@ -1088,7 +1173,7 @@ pub async fn start_machine(
         // enough — and passing `None` leaves the previous behaviour untouched.
         let pull_auth = registry_auth.clone();
         let pull = with_machine_client_traced(&entry, None, move |c| {
-            if c.query(&image_pull)?.is_none() {
+            if !image_is_local && c.query(&image_pull)?.is_none() {
                 let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
                 if let Some(auth) = pull_auth {
                     opts = opts.auth(auth);
@@ -1298,6 +1383,7 @@ pub async fn fork_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.image.as_deref(),
             record.dns_filter_hosts.clone(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
@@ -2224,6 +2310,59 @@ mod tests {
     }
 
     #[test]
+    fn api_image_validation_distinguishes_registry_tags_from_host_paths() {
+        assert!(validate_api_image_reference("repo:release.tar").is_ok());
+        assert!(validate_api_image_reference("org/image.tar.gz").is_ok());
+
+        for local in [
+            "-",
+            "/srv/rootfs",
+            "./rootfs",
+            "../rootfs",
+            r".\rootfs",
+            r"..\rootfs",
+            "local-dir:/srv/rootfs",
+            "local:deadbeef",
+        ] {
+            assert!(
+                validate_api_image_reference(local).is_err(),
+                "{local} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn create_source_validation_covers_rootfs_contract() {
+        let mut req = minimal_create_request();
+        req.source = Some(MachineSource::Rootfs {
+            path: "/srv/rootfs".to_string(),
+        });
+        req.cmd = vec!["/bin/sh".to_string()];
+        assert!(validate_create_source_request(&req).is_ok());
+
+        req.image = Some("alpine".to_string());
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+
+        req.image = None;
+        req.source = Some(MachineSource::Rootfs {
+            path: "relative/rootfs".to_string(),
+        });
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("must be absolute"));
+
+        req.source = Some(MachineSource::Rootfs {
+            path: "/srv/rootfs".to_string(),
+        });
+        req.cmd.clear();
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("no OCI entrypoint metadata"));
+    }
+
+    #[test]
     fn classify_launch_error_keeps_others_internal() {
         // An unrelated AddrInUse (no virtio context) must NOT be treated as a
         // published-port conflict — reallocating a port wouldn't help.
@@ -2372,6 +2511,7 @@ mod tests {
             network_backend: None,
             restart: None,
             image: None,
+            source: None,
             from: None,
             registry_ref: None,
             registry_identity_token: None,
@@ -2424,6 +2564,26 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn create_request_accepts_typed_rootfs_source() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "rootfs-vm",
+            "source": {
+                "type": "rootfs",
+                "path": "/opt/smolvm/rootfs/alpine"
+            },
+            "cmd": ["/bin/sleep", "infinity"]
+        }))
+        .unwrap();
+
+        match req.source {
+            Some(MachineSource::Rootfs { path }) => {
+                assert_eq!(path, "/opt/smolvm/rootfs/alpine");
+            }
+            _ => panic!("expected typed rootfs source"),
+        }
     }
 
     #[test]
