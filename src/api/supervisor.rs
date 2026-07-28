@@ -323,6 +323,19 @@ impl Supervisor {
                 {
                     tracing::warn!(machine = %name, error = %e, "failed to persist running state");
                 }
+                // A restarted image VM has only its agent after boot. Restore
+                // the configured workload just as explicit and implicit starts
+                // do; keep this best-effort so a workload failure does not turn
+                // a healthy VM restart into a failed restart.
+                if let Err(e) =
+                    crate::api::state::relaunch_image_workload(&self.state, name, &entry).await
+                {
+                    tracing::warn!(
+                        machine = %name,
+                        error = ?e,
+                        "failed to relaunch image workload after supervisor restart; VM is up but its server is not running"
+                    );
+                }
                 tracing::info!(machine = %name, pid = ?pid, "machine restarted successfully");
                 Ok(())
             }

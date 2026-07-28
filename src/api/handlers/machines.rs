@@ -304,34 +304,7 @@ pub async fn create_machine(
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Validate all machine source forms before resolving any of them.
-    let source_count = [
-        req.registry_ref.is_some(),
-        req.from.is_some(),
-        req.image.is_some(),
-        req.source.is_some(),
-    ]
-    .iter()
-    .filter(|&&b| b)
-    .count();
-    if source_count > 1 {
-        return Err(ApiError::BadRequest(
-            "'registryRef', 'from', 'image', and 'source' are mutually exclusive".to_string(),
-        ));
-    }
-    if let Some(image) = req.image.as_deref() {
-        if crate::data::image_source::is_local_ref(image)
-            || !matches!(
-                crate::data::image_source::classify(image),
-                crate::data::image_source::ImageSource::Registry(_)
-            )
-        {
-            return Err(ApiError::BadRequest(
-                "API 'image' accepts registry references only; use \
-                 source.type='rootfs' for an unpacked host rootfs"
-                    .to_string(),
-            ));
-        }
-    }
+    validate_create_source_request(&req).map_err(ApiError::BadRequest)?;
 
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
@@ -353,22 +326,20 @@ pub async fn create_machine(
     let mut req = req;
     if let Some(MachineSource::Rootfs { path }) = req.source.clone() {
         let rootfs = std::path::PathBuf::from(&path);
-        if !rootfs.is_absolute() {
-            return Err(ApiError::BadRequest(format!(
-                "rootfs source path must be absolute: {}",
-                rootfs.display()
-            )));
-        }
-        if req.entrypoint.is_empty() && req.cmd.is_empty() {
-            return Err(ApiError::BadRequest(
-                "a rootfs source has no OCI entrypoint metadata; provide 'entrypoint' or 'cmd'"
-                    .to_string(),
-            ));
-        }
         let resolved = tokio::task::spawn_blocking(move || {
-            crate::data::image_source::resolve(crate::data::image_source::ImageSource::Directory(
-                rootfs,
-            ))
+            let resolved = crate::data::image_source::resolve(
+                crate::data::image_source::ImageSource::Directory(rootfs),
+            )?;
+            if let crate::data::image_source::ResolvedImage::Local {
+                ref packed_layers_dir,
+                ..
+            } = resolved
+            {
+                if crate::process::vm_uid_drop_active() {
+                    crate::data::image_source::validate_rootfs_uid_ownership(packed_layers_dir)?;
+                }
+            }
+            Ok::<_, crate::Error>(resolved)
         })
         .await
         .map_err(|e| ApiError::internal(format!("rootfs resolution task: {e}")))?
@@ -944,6 +915,64 @@ fn validate_workload_image_source(
              machine has no workload to launch them in (use exec instead)"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+/// The API's untyped `image` field is registry-only. Reject only explicit host
+/// inputs here rather than reusing the CLI classifier: suffixes such as `.tar`
+/// are valid OCI tag/name text (for example `repo:release.tar`) but the CLI also
+/// uses them as a convenience signal for local archives.
+fn validate_api_image_reference(image: &str) -> Result<(), String> {
+    let path = std::path::Path::new(image);
+    let explicit_relative_path = image.starts_with("./")
+        || image.starts_with("../")
+        || image.starts_with(".\\")
+        || image.starts_with("..\\");
+    if crate::data::image_source::is_local_ref(image)
+        || image == "-"
+        || path.is_absolute()
+        || explicit_relative_path
+    {
+        return Err("API 'image' accepts registry references only; use \
+             source.type='rootfs' for an unpacked host rootfs"
+            .to_string());
+    }
+    Ok(())
+}
+
+fn validate_create_source_request(req: &CreateMachineRequest) -> Result<(), String> {
+    let source_count = [
+        req.registry_ref.is_some(),
+        req.from.is_some(),
+        req.image.is_some(),
+        req.source.is_some(),
+    ]
+    .iter()
+    .filter(|&&present| present)
+    .count();
+    if source_count > 1 {
+        return Err(
+            "'registryRef', 'from', 'image', and 'source' are mutually exclusive".to_string(),
+        );
+    }
+    if let Some(image) = req.image.as_deref() {
+        validate_api_image_reference(image)?;
+    }
+    if let Some(MachineSource::Rootfs { path }) = req.source.as_ref() {
+        let rootfs = std::path::Path::new(path);
+        if !rootfs.is_absolute() {
+            return Err(format!(
+                "rootfs source path must be absolute: {}",
+                rootfs.display()
+            ));
+        }
+        if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            return Err(
+                "a rootfs source has no OCI entrypoint metadata; provide 'entrypoint' or 'cmd'"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -2278,6 +2307,59 @@ mod tests {
         assert!(validate_workload_image_source(false, true, &cmd, &ep).is_ok());
         // Imageless with no workload is the ordinary exec-driven machine.
         assert!(validate_workload_image_source(false, false, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn api_image_validation_distinguishes_registry_tags_from_host_paths() {
+        assert!(validate_api_image_reference("repo:release.tar").is_ok());
+        assert!(validate_api_image_reference("org/image.tar.gz").is_ok());
+
+        for local in [
+            "-",
+            "/srv/rootfs",
+            "./rootfs",
+            "../rootfs",
+            r".\rootfs",
+            r"..\rootfs",
+            "local-dir:/srv/rootfs",
+            "local:deadbeef",
+        ] {
+            assert!(
+                validate_api_image_reference(local).is_err(),
+                "{local} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn create_source_validation_covers_rootfs_contract() {
+        let mut req = minimal_create_request();
+        req.source = Some(MachineSource::Rootfs {
+            path: "/srv/rootfs".to_string(),
+        });
+        req.cmd = vec!["/bin/sh".to_string()];
+        assert!(validate_create_source_request(&req).is_ok());
+
+        req.image = Some("alpine".to_string());
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+
+        req.image = None;
+        req.source = Some(MachineSource::Rootfs {
+            path: "relative/rootfs".to_string(),
+        });
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("must be absolute"));
+
+        req.source = Some(MachineSource::Rootfs {
+            path: "/srv/rootfs".to_string(),
+        });
+        req.cmd.clear();
+        assert!(validate_create_source_request(&req)
+            .unwrap_err()
+            .contains("no OCI entrypoint metadata"));
     }
 
     #[test]

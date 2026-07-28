@@ -303,7 +303,7 @@ pub fn init_packed_layers() -> Option<PathBuf> {
                 src.as_ptr(),
                 dst.as_ptr(),
                 fstype.as_ptr(),
-                0,
+                libc::MS_RDONLY,
                 std::ptr::null(),
             )
         };

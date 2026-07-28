@@ -630,7 +630,7 @@ pub fn launch_agent_vm_dynamic(
                 layers_tag.as_ptr(),
                 layers_path.as_ptr(),
                 VIRTIOFS_DAX_WINDOW,
-                false,
+                true,
             )
         } < 0
         {

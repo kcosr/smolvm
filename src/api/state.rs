@@ -1111,8 +1111,33 @@ pub fn build_launch_features(
         None => features,
     };
     if features.packed_layers_dir.is_none() {
-        features.packed_layers_dir =
-            image.and_then(crate::data::image_source::packed_layers_dir_for_ref);
+        if let Some(image) = image {
+            if let Some(source_dir) = crate::data::image_source::packed_layers_dir_for_ref(image) {
+                // A privileged API daemon drops each VMM to a dedicated uid.
+                // Present a direct rootfs through the same per-VM idmapped
+                // mount used by the shared pack store so root-owned 0600/0640
+                // files remain readable without changing the shared source.
+                if crate::data::image_source::is_local_dir_ref(image) {
+                    if let Some(name) = machine_name {
+                        // API create performs this check early for a 400, but a
+                        // persisted local-dir record may have been created by
+                        // the CLI or while uid dropping was disabled. Validate
+                        // at the actual idmap boundary too; successful paths are
+                        // process-cached, so restarts do not re-walk the tree.
+                        if crate::process::vm_uid_drop_active() {
+                            crate::data::image_source::validate_rootfs_uid_ownership(&source_dir)?;
+                        }
+                        features.packed_layers_dir =
+                            Some(crate::agent::machine_layers_cache_dir(name));
+                        features.pack_idmap_source = Some(source_dir);
+                    } else {
+                        features.packed_layers_dir = Some(source_dir);
+                    }
+                } else {
+                    features.packed_layers_dir = Some(source_dir);
+                }
+            }
+        }
     }
     // Carry the egress hostname allow-list into the boot config; `internal_boot`
     // starts the DNS filter for these names and learns their answers into the
@@ -1283,7 +1308,7 @@ pub async fn ensure_running_and_persist(
 /// overlay. No-op for machines without an image. The image is pulled only on a
 /// cache miss — on the wake path the machine has run before, so this is
 /// normally a no-op.
-async fn relaunch_image_workload(
+pub(crate) async fn relaunch_image_workload(
     state: &ApiState,
     name: &str,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
@@ -1592,6 +1617,22 @@ mod tests {
         let features = build_launch_features(None, None, Some(&reference), None).unwrap();
 
         assert_eq!(features.packed_layers_dir.as_deref(), Some(rootfs.path()));
+    }
+
+    #[test]
+    fn build_launch_features_idmaps_named_local_rootfs() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(rootfs.path().join("bin")).unwrap();
+        let reference = format!("local-dir:{}", rootfs.path().display());
+        let name = format!("rootfs-idmap-{}", std::process::id());
+
+        let features = build_launch_features(Some(&name), None, Some(&reference), None).unwrap();
+
+        assert_eq!(
+            features.packed_layers_dir,
+            Some(crate::agent::machine_layers_cache_dir(&name))
+        );
+        assert_eq!(features.pack_idmap_source.as_deref(), Some(rootfs.path()));
     }
 
     #[test]

@@ -86,7 +86,10 @@ smolvm machine run --image ./rootfs/ -- ./app
 
 The HTTP API uses an explicit host-local source type. The path is resolved on
 the server and must be absolute; because a flattened rootfs has no OCI
-entrypoint metadata, provide the workload command:
+entrypoint metadata, provide the workload command. The directory must look like
+a Linux rootfs. When `smolvm serve` runs as root with per-VM UID isolation, every
+entry's user owner must be root; group ownership does not need to match. This
+keeps the tree representable through the daemon's single-UID idmapped mount.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/machines \
