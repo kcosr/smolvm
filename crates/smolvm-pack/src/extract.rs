@@ -1863,9 +1863,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SparseCopyStrategy {
-    #[cfg(target_os = "linux")]
     Clone,
-    #[cfg(target_os = "linux")]
     SparseExtents,
     Scanned,
 }
@@ -1873,9 +1871,9 @@ pub(crate) enum SparseCopyStrategy {
 /// Copy `src` to `dst` while preserving holes (sparseness), regardless of the
 /// platform or filesystem.
 ///
-/// Linux first attempts a copy-on-write clone, then asks the filesystem for its
-/// allocated data extents. Other platforms, and Linux filesystems that support
-/// neither operation, use the portable zero-scanning fallback.
+/// Each platform first attempts its copy-on-write clone facility, then asks the
+/// filesystem for allocated data extents. Filesystems that support neither
+/// operation use the portable zero-scanning fallback.
 ///
 /// Used on both ends: the extract/run side here, and the pack-create side in
 /// `assets::create_storage_template` when it copies the pre-formatted
@@ -1887,6 +1885,23 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<SparseCopyS
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+
+    #[cfg(target_os = "macos")]
+    if try_clone_file_to_destination(&src_file, dst, parent)? {
+        return Ok(SparseCopyStrategy::Clone);
+    }
+
+    let mut temporary = create_sparse_temporary(parent)?;
+    let strategy = copy_sparse_file(&mut src_file, temporary.as_file_mut(), size)?;
+
+    // Keep an interrupted copy away from the final path. persist() atomically
+    // replaces an existing destination and cleans up the temporary file on error.
+    temporary.as_file().sync_all()?;
+    temporary.persist(dst).map_err(|error| error.error)?;
+    Ok(strategy)
+}
+
+fn create_sparse_temporary(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(".smolvm-sparse-copy-");
     #[cfg(unix)]
@@ -1896,14 +1911,7 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<SparseCopyS
         // process umask is still applied, preserving pack asset modes.
         builder.permissions(fs::Permissions::from_mode(0o666));
     }
-    let mut temporary = builder.tempfile_in(parent)?;
-    let strategy = copy_sparse_file(&mut src_file, temporary.as_file_mut(), size)?;
-
-    // Keep an interrupted copy away from the final path. persist() atomically
-    // replaces an existing destination and cleans up the temporary file on error.
-    temporary.as_file().sync_all()?;
-    temporary.persist(dst).map_err(|error| error.error)?;
-    Ok(strategy)
+    builder.tempfile_in(parent)
 }
 
 fn copy_sparse_file(
@@ -1918,7 +1926,17 @@ fn copy_sparse_file(
 
     prepare_sparse_destination(dst_file, size)?;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(windows)]
+    {
+        if try_clone_file(src_file, dst_file, size)? {
+            return Ok(SparseCopyStrategy::Clone);
+        }
+        // A multi-operation Windows block clone may discover an unsupported
+        // range after modifying earlier ranges. Reset before extent fallback.
+        prepare_sparse_destination(dst_file, size)?;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     if try_copy_sparse_extents(src_file, dst_file, size)? {
         return Ok(SparseCopyStrategy::SparseExtents);
     }
@@ -1936,6 +1954,61 @@ fn prepare_sparse_destination(dst_file: &File, size: u64) -> std::io::Result<()>
     mark_file_sparse(dst_file)?;
     dst_file.set_len(size)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn try_clone_file_to_destination(
+    src_file: &File,
+    dst: &Path,
+    parent: &Path,
+) -> std::io::Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // fclonefileat creates its destination and fails if it already exists. Use
+    // tempfile only to reserve a random same-directory name, then remove the
+    // placeholder before asking APFS to create the clone at that path.
+    let temporary = create_sparse_temporary(parent)?;
+    let permissions = temporary.as_file().metadata()?.permissions();
+    let temporary_path = temporary.into_temp_path();
+    fs::remove_file(&temporary_path)?;
+    let path = CString::new(temporary_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temporary sparse-copy path contains a NUL byte",
+        )
+    })?;
+
+    let result =
+        unsafe { libc::fclonefileat(src_file.as_raw_fd(), libc::AT_FDCWD, path.as_ptr(), 0) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error
+            .raw_os_error()
+            .is_some_and(is_unsupported_macos_clone_errno)
+        {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+
+    // clonefile copies source metadata. Restore normal created-file permissions
+    // so runtime disks remain writable and packed asset modes stay deterministic.
+    fs::set_permissions(&temporary_path, permissions)?;
+    let cloned = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary_path)?;
+    cloned.sync_all()?;
+    drop(cloned);
+    temporary_path.persist(dst).map_err(|error| error.error)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn is_unsupported_macos_clone_errno(errno: libc::c_int) -> bool {
+    matches!(errno, libc::ENOTSUP | libc::EXDEV | libc::ENOSYS)
 }
 
 #[cfg(target_os = "linux")]
@@ -1970,7 +2043,7 @@ fn is_unsupported_clone_errno(errno: libc::c_int) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn try_copy_sparse_extents(
     src_file: &mut File,
     dst_file: &mut File,
@@ -1982,9 +2055,9 @@ fn try_copy_sparse_extents(
 
     // This function must not modify dst_file before it knows the extent path is
     // usable. Ok(false) lets the caller safely start the scanner without reset.
-    // Linux has no _PC_MIN_HOLE_SIZE capability query. Probe SEEK_HOLE before
-    // writing anything so unsupported filesystems can use the scanner cleanly.
-    match linux_lseek(src_file, 0, libc::SEEK_HOLE) {
+    // Probe SEEK_HOLE before writing anything so unsupported filesystems can use
+    // the scanner cleanly.
+    match sparse_lseek(src_file, 0, libc::SEEK_HOLE) {
         Ok(_) => {}
         Err(error) if is_unsupported_seek_error(&error) => return Ok(false),
         Err(error) => return Err(error),
@@ -2017,12 +2090,12 @@ fn try_copy_sparse_extents(
     Ok(true)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn collect_sparse_extents(src_file: &File, size: u64) -> std::io::Result<Option<Vec<(u64, u64)>>> {
     let mut offset = 0;
     let mut extents = Vec::new();
     while offset < size {
-        let data_offset = match linux_lseek(src_file, offset, libc::SEEK_DATA) {
+        let data_offset = match sparse_lseek(src_file, offset, libc::SEEK_DATA) {
             Ok(data_offset) => data_offset,
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => break,
             Err(error) if is_unsupported_seek_error(&error) => return Ok(None),
@@ -2035,7 +2108,7 @@ fn collect_sparse_extents(src_file: &File, size: u64) -> std::io::Result<Option<
             ));
         }
 
-        let hole_offset = match linux_lseek(src_file, data_offset, libc::SEEK_HOLE) {
+        let hole_offset = match sparse_lseek(src_file, data_offset, libc::SEEK_HOLE) {
             Ok(hole_offset) => hole_offset,
             Err(error) if is_unsupported_seek_error(&error) => return Ok(None),
             Err(error) => return Err(error),
@@ -2055,7 +2128,7 @@ fn collect_sparse_extents(src_file: &File, size: u64) -> std::io::Result<Option<
     Ok(Some(extents))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn extent_map_preserves_sparseness(
     size: u64,
     source_allocation: (u64, u64),
@@ -2077,24 +2150,27 @@ fn extent_map_preserves_sparseness(
     })?;
     let (allocated_bytes, allocation_unit) = source_allocation;
 
-    // Linux permits a minimal SEEK_DATA/SEEK_HOLE implementation that reports
-    // the entire file as data. Do not let that densify a source whose st_blocks
-    // proves it is sparse. One allocation unit accounts for extent rounding.
+    // A filesystem may report the entire file as data. Do not let that densify
+    // a source whose st_blocks proves it is sparse. One allocation unit accounts
+    // for extent rounding.
     // Compression can make st_blocks smaller than accurate logical extents; in
     // that case this deliberately chooses the slower scanner for correctness.
     Ok(allocated_bytes >= size
         || reported_data_bytes <= allocated_bytes.saturating_add(allocation_unit))
 }
 
-#[cfg(target_os = "linux")]
-fn linux_lseek(file: &File, offset: u64, whence: libc::c_int) -> std::io::Result<u64> {
-    let offset = libc::off64_t::try_from(offset).map_err(|_| {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sparse_lseek(file: &File, offset: u64, whence: libc::c_int) -> std::io::Result<u64> {
+    let offset = i64::try_from(offset).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "sparse-file offset exceeds off64_t",
+            "sparse-file offset exceeds the platform file-offset type",
         )
     })?;
-    let result = unsafe { libc::lseek64(file.as_raw_fd(), offset, whence) };
+    #[cfg(target_os = "linux")]
+    let result = unsafe { libc::lseek64(file.as_raw_fd(), offset as libc::off64_t, whence) };
+    #[cfg(target_os = "macos")]
+    let result = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
     if result == -1 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -2102,7 +2178,7 @@ fn linux_lseek(file: &File, offset: u64, whence: libc::c_int) -> std::io::Result
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_unsupported_seek_error(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -2110,7 +2186,7 @@ fn is_unsupported_seek_error(error: &std::io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn copy_byte_range_buffered(
     src_file: &mut File,
     dst_file: &mut File,
@@ -2136,6 +2212,214 @@ fn copy_byte_range_buffered(
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn try_clone_file(src_file: &File, dst_file: &File, size: u64) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    if size == 0 {
+        return Ok(false);
+    }
+    i64::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sparse-copy source is too large for Windows block cloning",
+        )
+    })?;
+
+    // ReFS requires each cloned region to be smaller than 4 GiB. Subtract its
+    // largest supported cluster size so every intermediate chunk remains
+    // cluster-aligned. If a later chunk proves unsupported, the caller resets
+    // the temporary destination before falling back to allocated-range copying.
+    const MAX_CLONE_BYTES: u64 = 4 * 1024 * 1024 * 1024 - 64 * 1024;
+    let mut offset = 0u64;
+    while offset < size {
+        let byte_count = (size - offset).min(MAX_CLONE_BYTES);
+        let input = DUPLICATE_EXTENTS_DATA {
+            FileHandle: src_file.as_raw_handle(),
+            SourceFileOffset: offset as i64,
+            TargetFileOffset: offset as i64,
+            ByteCount: byte_count as i64,
+        };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                dst_file.as_raw_handle(),
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                (&input as *const DUPLICATE_EXTENTS_DATA).cast(),
+                std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            return if is_unsupported_windows_clone_error(&error) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        offset += byte_count;
+    }
+
+    if src_file.metadata()?.len() != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source file size changed during Windows block clone",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn is_unsupported_windows_clone_error(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+    };
+
+    error.raw_os_error().is_some_and(|errno| {
+        matches!(
+            errno as u32,
+            ERROR_INVALID_FUNCTION
+                | ERROR_INVALID_PARAMETER
+                | ERROR_NOT_SAME_DEVICE
+                | ERROR_NOT_SUPPORTED
+        )
+    })
+}
+
+#[cfg(windows)]
+fn try_copy_sparse_extents(
+    src_file: &mut File,
+    dst_file: &mut File,
+    size: u64,
+) -> std::io::Result<bool> {
+    if size == 0 {
+        return Ok(true);
+    }
+    let Some(extents) = collect_windows_allocated_ranges(src_file, size)? else {
+        return Ok(false);
+    };
+
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for (start, end) in extents {
+        copy_byte_range_buffered(src_file, dst_file, start, end, &mut buffer)?;
+    }
+    if src_file.metadata()?.len() != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "source file size changed during Windows sparse copy",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn collect_windows_allocated_ranges(
+    src_file: &File,
+    size: u64,
+) -> std::io::Result<Option<Vec<(u64, u64)>>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let size = i64::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sparse-copy source is too large for Windows range queries",
+        )
+    })?;
+    const RANGE_CAPACITY: usize = 256;
+    let mut output = [FILE_ALLOCATED_RANGE_BUFFER::default(); RANGE_CAPACITY];
+    let mut extents = Vec::new();
+    let mut cursor = 0i64;
+
+    while cursor < size {
+        let input = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: cursor,
+            Length: size - cursor,
+        };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                src_file.as_raw_handle(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&input as *const FILE_ALLOCATED_RANGE_BUFFER).cast(),
+                std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                std::mem::size_of_val(&output) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            let unsupported = error.raw_os_error().is_some_and(|errno| {
+                matches!(errno as u32, ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+            });
+            if unsupported && extents.is_empty() {
+                return Ok(None);
+            }
+            if error.raw_os_error().map(|errno| errno as u32) != Some(ERROR_MORE_DATA) {
+                return Err(error);
+            }
+        }
+
+        let entry_size = std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        if !(returned as usize).is_multiple_of(entry_size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows returned a partial allocated-range record",
+            ));
+        }
+        let count = returned as usize / entry_size;
+        let previous_cursor = cursor;
+        for range in &output[..count] {
+            if range.FileOffset < 0 || range.Length <= 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Windows returned an invalid allocated range",
+                ));
+            }
+            let range_end = range.FileOffset.checked_add(range.Length).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Windows allocated range overflowed",
+                )
+            })?;
+            let start = range.FileOffset.max(previous_cursor).min(size);
+            let end = range_end.min(size);
+            if start < end {
+                extents.push((start as u64, end as u64));
+                cursor = cursor.max(end);
+            }
+        }
+
+        if ok != 0 {
+            break;
+        }
+        if count == 0 || cursor <= previous_cursor {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows allocated-range query did not advance",
+            ));
+        }
+    }
+
+    Ok(Some(extents))
 }
 
 fn copy_scanning_for_nonzero_chunks(
@@ -2816,11 +3100,9 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn test_sparse_extent_copy_preserves_contents_and_holes() {
-        use std::os::unix::fs::MetadataExt;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("source.raw");
         let destination = temp_dir.path().join("destination.raw");
@@ -2851,11 +3133,15 @@ mod tests {
         drop(destination_file);
 
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
-        let allocated_bytes = fs::metadata(&destination).unwrap().blocks() * 512;
-        assert!(
-            allocated_bytes < 4 * 1024 * 1024,
-            "extent copy densified destination: {allocated_bytes} bytes allocated"
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let allocated_bytes = fs::metadata(&destination).unwrap().blocks() * 512;
+            assert!(
+                allocated_bytes < 4 * 1024 * 1024,
+                "extent copy densified destination: {allocated_bytes} bytes allocated"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2874,6 +3160,67 @@ mod tests {
         let destination_file = File::create(&destination).unwrap();
         if !try_clone_file(&source_file, &destination_file).unwrap() {
             eprintln!("skipping: test filesystem does not support FICLONE");
+            return;
+        }
+        drop(source_file);
+        drop(destination_file);
+
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .unwrap()
+            .write_all(b"target")
+            .unwrap();
+        assert_eq!(&fs::read(&source).unwrap()[..6], b"source");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_clone_preserves_contents_and_independence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        {
+            let mut file = File::create(&source).unwrap();
+            file.write_all(b"source").unwrap();
+            file.set_len(16 * 1024 * 1024).unwrap();
+        }
+
+        let source_file = File::open(&source).unwrap();
+        if !try_clone_file_to_destination(&source_file, &destination, temp_dir.path()).unwrap() {
+            eprintln!("skipping: test filesystem does not support fclonefileat");
+            return;
+        }
+
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .unwrap()
+            .write_all(b"target")
+            .unwrap();
+        assert_eq!(&fs::read(&source).unwrap()[..6], b"source");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_block_clone_preserves_contents_and_independence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let logical_size = 16 * 1024 * 1024;
+        {
+            let mut file = File::create(&source).unwrap();
+            file.write_all(b"source").unwrap();
+            file.set_len(logical_size).unwrap();
+        }
+
+        let source_file = File::open(&source).unwrap();
+        let destination_file = File::create(&destination).unwrap();
+        prepare_sparse_destination(&destination_file, logical_size).unwrap();
+        if !try_clone_file(&source_file, &destination_file, logical_size).unwrap() {
+            eprintln!("skipping: test filesystem does not support block cloning");
             return;
         }
         drop(source_file);
@@ -2913,7 +3260,7 @@ mod tests {
         assert_eq!(fs::metadata(&destination).unwrap().len(), logical_size);
         assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             let probe = temp_dir.path().join("extent-probe.raw");
             let mut source_file = File::open(&source).unwrap();
@@ -2984,6 +3331,59 @@ mod tests {
                 "all-hole destination was densified"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires SMOLVM_SPARSE_TEST_SOURCE_DIR and SMOLVM_SPARSE_TEST_DEST_DIR"]
+    fn test_sparse_copy_in_host_provided_directories() {
+        let source_dir = PathBuf::from(
+            std::env::var_os("SMOLVM_SPARSE_TEST_SOURCE_DIR")
+                .expect("SMOLVM_SPARSE_TEST_SOURCE_DIR is required"),
+        );
+        let destination_dir = PathBuf::from(
+            std::env::var_os("SMOLVM_SPARSE_TEST_DEST_DIR")
+                .expect("SMOLVM_SPARSE_TEST_DEST_DIR is required"),
+        );
+        let suffix = std::process::id();
+        let source = source_dir.join(format!("smolvm-sparse-source-{suffix}.raw"));
+        let destination = destination_dir.join(format!("smolvm-sparse-destination-{suffix}.raw"));
+        let logical_size = 64 * 1024 * 1024;
+        {
+            let mut file = File::create(&source).unwrap();
+            #[cfg(windows)]
+            mark_file_sparse(&file).unwrap();
+            file.set_len(logical_size).unwrap();
+            for (offset, data) in [
+                (0, b"start".as_slice()),
+                (7 * 1024 * 1024 + 13, b"middle".as_slice()),
+                (logical_size - 4, b"tail".as_slice()),
+            ] {
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(data).unwrap();
+            }
+        }
+
+        let strategy = sparse_copy(&source, &destination).unwrap();
+        eprintln!("selected sparse-copy strategy: {strategy:?}");
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+
+        if let Ok(expected) = std::env::var("SMOLVM_EXPECT_SPARSE_STRATEGY") {
+            let matches = match expected.as_str() {
+                "clone" => strategy == SparseCopyStrategy::Clone,
+                "sparse-extents" => strategy == SparseCopyStrategy::SparseExtents,
+                "scanned" => strategy == SparseCopyStrategy::Scanned,
+                _ => panic!(
+                    "SMOLVM_EXPECT_SPARSE_STRATEGY must be clone, sparse-extents, or scanned"
+                ),
+            };
+            assert!(
+                matches,
+                "expected sparse-copy strategy {expected}, got {strategy:?}"
+            );
+        }
+
+        fs::remove_file(&source).unwrap();
+        fs::remove_file(&destination).unwrap();
     }
 
     #[test]
@@ -3071,6 +3471,72 @@ mod tests {
         assert!(!is_unsupported_clone_errno(libc::EACCES));
         assert!(!is_unsupported_clone_errno(libc::ENOSPC));
         assert!(!is_unsupported_clone_errno(libc::EBADF));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_clone_fallback_errno_classification() {
+        for errno in [libc::ENOTSUP, libc::EXDEV, libc::ENOSYS] {
+            assert!(is_unsupported_macos_clone_errno(errno));
+        }
+        assert!(!is_unsupported_macos_clone_errno(libc::EACCES));
+        assert!(!is_unsupported_macos_clone_errno(libc::ENOSPC));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_clone_fallback_error_classification() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+        };
+
+        for error in [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SAME_DEVICE,
+            ERROR_NOT_SUPPORTED,
+        ] {
+            assert!(is_unsupported_windows_clone_error(
+                &std::io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+        for error in [ERROR_ACCESS_DENIED, ERROR_DISK_FULL] {
+            assert!(!is_unsupported_windows_clone_error(
+                &std::io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_allocated_range_pagination_preserves_contents() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.raw");
+        let destination = temp_dir.path().join("destination.raw");
+        let logical_size = 6 * 1024 * 1024;
+        {
+            let mut file = File::create(&source).unwrap();
+            mark_file_sparse(&file).unwrap();
+            file.set_len(logical_size).unwrap();
+            for offset in (0..logical_size).step_by(16 * 1024) {
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(b"x").unwrap();
+            }
+        }
+
+        let mut source_file = File::open(&source).unwrap();
+        let mut destination_file = File::create(&destination).unwrap();
+        prepare_sparse_destination(&destination_file, logical_size).unwrap();
+        if !try_copy_sparse_extents(&mut source_file, &mut destination_file, logical_size).unwrap()
+        {
+            eprintln!("skipping: test filesystem does not support allocated-range queries");
+            return;
+        }
+        drop(source_file);
+        drop(destination_file);
+
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
     }
 
     #[test]
@@ -3729,6 +4195,7 @@ mod tests {
         assert!(!dest.join("unknown-type-entry").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_evict_cache_to_size_lru() {
         use std::ffi::CString;
@@ -3764,6 +4231,7 @@ mod tests {
         assert!(mid.exists() && new.exists(), "newer extractions kept");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_evict_cache_protects_current_extraction() {
         use std::ffi::CString;
