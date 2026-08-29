@@ -569,8 +569,16 @@ else
     # Create sparse file
     dd if=/dev/zero of="$TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
 
-    # Format with ext4
-    "$MKFS_BIN" -F -q -m 0 -L smolvm "$TEMPLATE_PATH"
+    # Keep packaged templates reproducible when the caller supplies
+    # E2FSPROGS_FAKE_TIME (normally derived from SOURCE_DATE_EPOCH). mke2fs
+    # otherwise generates both a random filesystem UUID and a random directory
+    # hash seed, making byte-for-byte release verification impossible. Storage
+    # and overlay use distinct identities even though every runtime copy of a
+    # given immutable template intentionally starts with the same identity.
+    "$MKFS_BIN" -F -q -m 0 -L smolvm \
+        -U 534d4f4c-564d-4001-8000-000000000001 \
+        -E hash_seed=534d4f4c-564d-4001-8000-000000000002 \
+        "$TEMPLATE_PATH"
 
     # Size to the default storage virtual size (DEFAULT_STORAGE_SIZE_GIB=20) so a
     # fresh VM boots from an instant qcow2 overlay (the guest grows the 512 MiB
@@ -581,7 +589,10 @@ else
     # Create overlay template (same format, different label)
     OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
     dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
-    "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
+    "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay \
+        -U 534d4f4c-564d-4002-8000-000000000001 \
+        -E hash_seed=534d4f4c-564d-4002-8000-000000000002 \
+        "$OVERLAY_TEMPLATE_PATH"
     # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
     extend_sparse "$OVERLAY_TEMPLATE_PATH" $((10 * 1024 * 1024 * 1024))
     echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) physical (10 GiB virtual)"
