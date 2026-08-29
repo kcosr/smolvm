@@ -242,11 +242,67 @@ fn prepare_published_socket_host_dir(
 ) -> std::io::Result<()> {
     if let Some(runtime_dir) = runtime_dir.filter(|_| !sockets.is_empty()) {
         let published_dir = crate::config::published_socket_host_dir(runtime_dir);
-        std::fs::create_dir_all(&published_dir)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&published_dir, std::fs::Permissions::from_mode(0o700))?;
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            // The dropped VMM UID owns runtime_dir. Never follow a leaf it may
+            // have replaced with a symlink between launches: this preparation
+            // runs as root before the next UID drop. Open the directory with
+            // O_NOFOLLOW and apply permissions through the resulting fd so the
+            // validation and chmod cannot race a rename of the leaf.
+            loop {
+                match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(&published_dir)
+                {
+                    Ok(dir) => {
+                        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::create_dir(&published_dir) {
+                            Ok(()) => continue,
+                            Err(create_error)
+                                if create_error.kind() == std::io::ErrorKind::AlreadyExists =>
+                            {
+                                continue;
+                            }
+                            Err(create_error) => return Err(create_error),
+                        }
+                    }
+                    Err(error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "published socket host directory {} must be a real directory: {error}",
+                                published_dir.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::symlink_metadata(&published_dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "published socket host directory {} must be a real directory",
+                            published_dir.display()
+                        ),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&published_dir)?;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
@@ -3225,6 +3281,32 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_socket_host_dir_rejects_planted_symlink_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&victim, temp.path().join("published-sockets")).unwrap();
+
+        let socket = crate::config::PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/agent-workspaces/agent.sock".into(),
+            host_path: None,
+        };
+        let error = prepare_published_socket_host_dir(Some(temp.path()), &[socket]).unwrap_err();
+
+        assert!(error.to_string().contains("must be a real directory"));
+        assert_eq!(
+            victim.metadata().unwrap().permissions().mode() & 0o777,
+            0o755,
+            "a planted symlink must not make root chmod its target"
+        );
     }
 
     #[test]
