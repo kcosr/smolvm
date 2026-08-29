@@ -162,11 +162,22 @@ pub fn scope_name(machine_id: &str) -> String {
 /// Adopt an already-forked VM `pid` into its own transient scope with `caps`.
 ///
 /// Returns `Err` if systemd rejects the request (e.g. the PID already exited, or
-/// the bus call failed); the caller should fall back to plain cgroup placement
-/// rather than failing the launch.
+/// the bus call failed). When scope mode is required, the caller must terminate
+/// the unadopted child rather than leave it running without these caps.
 pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<()> {
     let busctl = busctl_path()
         .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot create scope"))?;
+    adopt_into_scope_with(machine_id, pid, caps, |args| {
+        let mut cmd = Command::new(&busctl);
+        cmd.args(args);
+        busctl_bounded(cmd, BUSCTL_TIMEOUT)
+    })
+}
+
+fn adopt_into_scope_with<F>(machine_id: &str, pid: i32, caps: &ScopeCaps, mut run: F) -> Result<()>
+where
+    F: FnMut(&[String]) -> Result<Output>,
+{
     let name = scope_name(machine_id);
 
     // Build the a(sv) property list in busctl's positional encoding:
@@ -213,19 +224,152 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     args.extend(props);
     args.push("0".into()); // empty aux array
 
-    let mut cmd = Command::new(&busctl);
-    cmd.args(&args);
-    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    let mut out = run(&args)?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(Error::agent(
-            "vm scope",
-            format!("StartTransientUnit {name} failed: {}", stderr.trim()),
-        ));
+        let original_error = format!("StartTransientUnit {name} failed: {}", stderr.trim());
+        if unit_exists_error(&stderr) {
+            if let Some(state) = loaded_unit_active_state(&name, &mut run)? {
+                if matches!(state.as_str(), "failed" | "inactive") {
+                    reset_failed_unit(&name, &mut run)?;
+                    out = run(&args)?;
+                    if out.status.success() {
+                        tracing::info!(scope = %name, pid, previous_state = %state,
+                            "reset stale transient scope and adopted VM");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let retry_stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = if retry_stderr.trim().is_empty() {
+            original_error
+        } else {
+            format!("{original_error}; retry failed: {}", retry_stderr.trim())
+        };
+        return Err(Error::agent("vm scope", detail));
     }
     tracing::info!(scope = %name, pid, "adopted VM into systemd transient scope");
     Ok(())
+}
+
+fn unit_exists_error(stderr: &str) -> bool {
+    stderr.contains("UnitExists")
+        || stderr.contains("already loaded")
+        || stderr.contains("already exists")
+}
+
+fn quoted_busctl_value(output: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(output).ok()?;
+    let start = text.find('"')? + 1;
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_string())
+}
+
+fn loaded_unit_active_state<F>(name: &str, run: &mut F) -> Result<Option<String>>
+where
+    F: FnMut(&[String]) -> Result<Output>,
+{
+    let get_unit = vec![
+        "call".into(),
+        "org.freedesktop.systemd1".into(),
+        "/org/freedesktop/systemd1".into(),
+        "org.freedesktop.systemd1.Manager".into(),
+        "GetUnit".into(),
+        "s".into(),
+        name.into(),
+    ];
+    let output = run(&get_unit)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let Some(object_path) = quoted_busctl_value(&output.stdout) else {
+        return Err(Error::agent("vm scope", "GetUnit returned no object path"));
+    };
+    let get_state = vec![
+        "get-property".into(),
+        "org.freedesktop.systemd1".into(),
+        object_path,
+        "org.freedesktop.systemd1.Unit".into(),
+        "ActiveState".into(),
+    ];
+    let output = run(&get_state)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(quoted_busctl_value(&output.stdout))
+}
+
+fn reset_failed_unit<F>(name: &str, run: &mut F) -> Result<()>
+where
+    F: FnMut(&[String]) -> Result<Output>,
+{
+    let args = vec![
+        "call".into(),
+        "org.freedesktop.systemd1".into(),
+        "/org/freedesktop/systemd1".into(),
+        "org.freedesktop.systemd1.Manager".into(),
+        "ResetFailedUnit".into(),
+        "s".into(),
+        name.into(),
+    ];
+    let output = run(&args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::agent(
+            "vm scope",
+            format!(
+                "ResetFailedUnit {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+}
+
+/// Resume every process in an adopted VM scope without addressing the child by
+/// a potentially reusable numeric PID.
+#[cfg(target_os = "linux")]
+pub fn continue_scope(machine_id: &str) -> Result<()> {
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot resume scope"))?;
+    signal_scope_with(machine_id, libc::SIGCONT, |args| {
+        let mut cmd = Command::new(&busctl);
+        cmd.args(args);
+        busctl_bounded(cmd, BUSCTL_TIMEOUT)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn signal_scope_with<F>(machine_id: &str, signal: i32, mut run: F) -> Result<()>
+where
+    F: FnMut(&[String]) -> Result<Output>,
+{
+    let name = scope_name(machine_id);
+    let args = vec![
+        "call".into(),
+        "org.freedesktop.systemd1".into(),
+        "/org/freedesktop/systemd1".into(),
+        "org.freedesktop.systemd1.Manager".into(),
+        "KillUnit".into(),
+        "ssi".into(),
+        name.clone(),
+        "all".into(),
+        signal.to_string(),
+    ];
+    let output = run(&args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::agent(
+            "vm scope",
+            format!(
+                "signal {signal} to {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
 }
 
 /// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
@@ -289,6 +433,153 @@ pub fn kill_scope(machine_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn output(success: bool, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_resets_only_failed_stale_scope_then_retries() {
+        let mut methods = Vec::new();
+        let mut starts = 0;
+        let result = adopt_into_scope_with("stale", 4242, &ScopeCaps::default(), |args| {
+            let method = args
+                .iter()
+                .find(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "StartTransientUnit" | "GetUnit" | "ActiveState" | "ResetFailedUnit"
+                    )
+                })
+                .cloned()
+                .unwrap();
+            methods.push(method.clone());
+            Ok(match method.as_str() {
+                "StartTransientUnit" => {
+                    starts += 1;
+                    if starts == 1 {
+                        output(false, "", "UnitExists: Unit already loaded")
+                    } else {
+                        output(true, "o \"/job/1\"", "")
+                    }
+                }
+                "GetUnit" => output(true, "o \"/org/freedesktop/systemd1/unit/stale\"", ""),
+                "ActiveState" => output(true, "s \"failed\"", ""),
+                "ResetFailedUnit" => output(true, "", ""),
+                _ => unreachable!(),
+            })
+        });
+
+        result.unwrap();
+        assert_eq!(
+            methods,
+            [
+                "StartTransientUnit",
+                "GetUnit",
+                "ActiveState",
+                "ResetFailedUnit",
+                "StartTransientUnit"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_also_recovers_an_inactive_stale_scope() {
+        let mut starts = 0;
+        let mut reset = false;
+        let result = adopt_into_scope_with("inactive", 4242, &ScopeCaps::default(), |args| {
+            if args.iter().any(|arg| arg == "StartTransientUnit") {
+                starts += 1;
+                return Ok(if starts == 1 {
+                    output(false, "", "UnitExists: Unit already loaded")
+                } else {
+                    output(true, "o \"/job/1\"", "")
+                });
+            }
+            if args.iter().any(|arg| arg == "GetUnit") {
+                return Ok(output(
+                    true,
+                    "o \"/org/freedesktop/systemd1/unit/inactive\"",
+                    "",
+                ));
+            }
+            if args.iter().any(|arg| arg == "ActiveState") {
+                return Ok(output(true, "s \"inactive\"", ""));
+            }
+            if args.iter().any(|arg| arg == "ResetFailedUnit") {
+                reset = true;
+                return Ok(output(true, "", ""));
+            }
+            unreachable!()
+        });
+
+        result.unwrap();
+        assert!(reset);
+        assert_eq!(starts, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_never_resets_or_retries_an_active_scope() {
+        let mut methods = Vec::new();
+        let result = adopt_into_scope_with("active", 4242, &ScopeCaps::default(), |args| {
+            let method = args
+                .iter()
+                .find(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "StartTransientUnit" | "GetUnit" | "ActiveState" | "ResetFailedUnit"
+                    )
+                })
+                .cloned()
+                .unwrap();
+            methods.push(method.clone());
+            Ok(match method.as_str() {
+                "StartTransientUnit" => output(false, "", "UnitExists: Unit already loaded"),
+                "GetUnit" => output(true, "o \"/org/freedesktop/systemd1/unit/active\"", ""),
+                "ActiveState" => output(true, "s \"active\"", ""),
+                "ResetFailedUnit" => panic!("an active scope must never be reset"),
+                _ => unreachable!(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(methods, ["StartTransientUnit", "GetUnit", "ActiveState"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopted_child_is_resumed_through_its_scope_identity() {
+        let mut observed = Vec::new();
+        signal_scope_with("machine-a", libc::SIGCONT, |args| {
+            observed = args.to_vec();
+            Ok(output(true, "", ""))
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            vec![
+                "call".to_string(),
+                "org.freedesktop.systemd1".to_string(),
+                "/org/freedesktop/systemd1".to_string(),
+                "org.freedesktop.systemd1.Manager".to_string(),
+                "KillUnit".to_string(),
+                "ssi".to_string(),
+                "smolvm-vm-machine-a.scope".to_string(),
+                "all".to_string(),
+                libc::SIGCONT.to_string(),
+            ]
+        );
+    }
 
     // A wedged busctl (systemd stuck on a dying cgroup) must not pin the thread:
     // the call is bounded and returns promptly, well under the hang it replaces.

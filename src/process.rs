@@ -1458,6 +1458,144 @@ pub fn register_vm_child(pid: i32) {
     vm_children().lock().unwrap().push(pid);
 }
 
+/// Kill and synchronously reap a just-spawned VM that could not be placed into
+/// its required systemd scope. This is deliberately per-PID: scope adoption
+/// failure must never leave that exact child running uncapped in the service
+/// cgroup, and must not disturb any existing same-name active scope.
+#[cfg(target_os = "linux")]
+pub fn kill_and_reap_unadopted_vm_child(pid: i32) {
+    let _ = kill(pid);
+    let _ = wait(pid);
+    vm_children()
+        .lock()
+        .unwrap()
+        .retain(|candidate| *candidate != pid);
+}
+
+/// Reap and unregister an exact VM child without signalling its numeric PID.
+#[cfg(target_os = "linux")]
+pub fn reap_vm_child(pid: i32) {
+    let _ = wait(pid);
+    vm_children()
+        .lock()
+        .unwrap()
+        .retain(|candidate| *candidate != pid);
+}
+
+/// Failure while waiting for the pre-scope child barrier.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum VmChildScopeBarrierError {
+    /// `waitpid` observed and reaped the child. Its numeric PID must never be
+    /// signalled afterward because the kernel may already have reused it.
+    ChildReaped(i32),
+    /// Another registered-child reaper got there first. Treat this exactly as
+    /// reaped; ownership of the numeric PID can no longer be proven.
+    NoChild,
+    /// The child is still ours (for example a timeout) and must be terminated.
+    Live(std::io::Error),
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for VmChildScopeBarrierError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChildReaped(status) => {
+                write!(
+                    formatter,
+                    "boot child exited before scope barrier (status {status:#x})"
+                )
+            }
+            Self::NoChild => write!(
+                formatter,
+                "boot child was already reaped before scope barrier"
+            ),
+            Self::Live(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_after_scope_barrier_error_with<F>(
+    pid: i32,
+    error: &VmChildScopeBarrierError,
+    terminate: F,
+) -> bool
+where
+    F: FnOnce(i32),
+{
+    if matches!(error, VmChildScopeBarrierError::Live(_)) {
+        terminate(pid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Terminate a child only when the failed barrier wait still proves ownership.
+/// Returns whether termination was attempted.
+#[cfg(target_os = "linux")]
+pub fn cleanup_after_scope_barrier_error(pid: i32, error: &VmChildScopeBarrierError) -> bool {
+    cleanup_after_scope_barrier_error_with(pid, error, kill_and_reap_unadopted_vm_child)
+}
+
+/// Wait until a newly spawned boot helper has entered its scope-adoption
+/// SIGSTOP barrier. A bounded wait prevents a broken helper from pinning the
+/// launcher before scope placement.
+#[cfg(target_os = "linux")]
+pub fn wait_for_vm_child_scope_barrier(
+    pid: i32,
+    timeout: Duration,
+) -> std::result::Result<(), VmChildScopeBarrierError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if result == pid {
+            if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP {
+                return Ok(());
+            }
+            vm_children()
+                .lock()
+                .unwrap()
+                .retain(|candidate| *candidate != pid);
+            return Err(VmChildScopeBarrierError::ChildReaped(status));
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                vm_children()
+                    .lock()
+                    .unwrap()
+                    .retain(|candidate| *candidate != pid);
+                return Err(VmChildScopeBarrierError::NoChild);
+            }
+            return Err(VmChildScopeBarrierError::Live(error));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(VmChildScopeBarrierError::Live(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "boot child did not reach scope barrier",
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Release a boot helper after systemd has adopted its stopped PID into the
+/// required capped transient scope.
+pub fn continue_scoped_vm_child(pid: i32) -> std::io::Result<()> {
+    if unsafe { libc::kill(pid, libc::SIGCONT) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Reap any exited registered VM children (non-blocking, per-PID). Called from
 /// the serve supervisor tick. Scoped to registered PIDs so it never steals an
 /// exit status from a sibling `.output()`/`.wait()` (the `ECHILD` fix).
@@ -2842,6 +2980,44 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_uid_drop_clears_all_process_capabilities() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if drop_privileges(65_534, 65_534).is_err() {
+                    libc::_exit(2);
+                }
+                let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+                    libc::_exit(3);
+                };
+                let zero = |name: &str| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with(name))
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        == Some("0000000000000000")
+                };
+                libc::_exit(if zero("CapPrm:") && zero("CapEff:") && zero("CapAmb:") {
+                    0
+                } else {
+                    4
+                });
+            }
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "dropped VMM identity retained capabilities, status={status:#x}"
+            );
+        }
+    }
+
     /// `(base, registry, vms)` laid out as production: `<base>/smolvm/{uids,vms}`,
     /// so the allocator's `registry.parent()/vms` resolves to `vms`. A VM's data
     /// dir is `vms/<vm_key>`.
@@ -2959,6 +3135,101 @@ mod tests {
             drained,
             "registry should drain: real child reaped, bogus PID dropped on ECHILD"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_scope_adoption_leaves_no_uncapped_child() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id() as i32;
+        std::mem::forget(child);
+        register_vm_child(pid);
+
+        kill_and_reap_unadopted_vm_child(pid);
+
+        assert!(!is_alive(pid), "the unadopted child must not survive");
+        assert!(!vm_children().lock().unwrap().contains(&pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_barrier_prevents_child_execution_until_parent_continues_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker =
+            std::ffi::CString::new(temp.path().join("continued").as_os_str().as_encoded_bytes())
+                .unwrap();
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::raise(libc::SIGSTOP);
+                let fd = libc::open(
+                    marker.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                );
+                if fd >= 0 {
+                    libc::close(fd);
+                    libc::_exit(0);
+                }
+                libc::_exit(2);
+            }
+            wait_for_vm_child_scope_barrier(pid, Duration::from_secs(2)).unwrap();
+            assert!(
+                !temp.path().join("continued").exists(),
+                "stopped child executed beyond the pre-KVM barrier"
+            );
+            continue_scoped_vm_child(pid).unwrap();
+            assert_eq!(wait(pid), 0);
+            assert!(temp.path().join("continued").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exit_before_scope_barrier_is_reaped_without_a_numeric_pid_kill() {
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::_exit(7);
+            }
+            register_vm_child(pid);
+            let error = wait_for_vm_child_scope_barrier(pid, Duration::from_secs(2)).unwrap_err();
+            assert!(matches!(error, VmChildScopeBarrierError::ChildReaped(_)));
+            let mut signalled = false;
+            assert!(!cleanup_after_scope_barrier_error_with(pid, &error, |_| {
+                signalled = true
+            }));
+            assert!(!signalled, "a reaped numeric PID must never be killed");
+            assert!(!vm_children().lock().unwrap().contains(&pid));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_reaped_by_supervisor_before_barrier_is_never_killed_by_pid() {
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            assert_eq!(wait(pid), 0, "simulated supervisor reaper");
+            register_vm_child(pid);
+            let error =
+                wait_for_vm_child_scope_barrier(pid, Duration::from_millis(20)).unwrap_err();
+            assert!(matches!(error, VmChildScopeBarrierError::NoChild));
+            let mut signalled = false;
+            assert!(!cleanup_after_scope_barrier_error_with(pid, &error, |_| {
+                signalled = true
+            }));
+            assert!(!signalled, "an ECHILD numeric PID must never be killed");
+            assert!(!vm_children().lock().unwrap().contains(&pid));
+        }
     }
 
     /// `process_stats` must report live CPU/RSS for our own (alive) process on

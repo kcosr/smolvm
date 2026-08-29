@@ -805,10 +805,267 @@ impl<K: DiskType> VmDisk<K> {
         found
     }
 
+    /// Make the managed default template backing this disk readable by a VMM
+    /// that will drop to a dedicated uid.
+    ///
+    /// Only SmolVM's exact conventional template locations are eligible. An
+    /// arbitrary qcow2 backing path, symlink, hard link, non-regular file, or
+    /// template not owned by the current privileged manager is rejected rather
+    /// than chmodded. The template is immutable-by-permissions (0444) and its
+    /// ancestor chain is made traverse-only where needed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_default_template_for_uid_drop(&self) -> Result<()> {
+        if self.format != DiskFormat::Qcow2 {
+            return Ok(());
+        }
+        let backing = read_direct_qcow2_backing(&self.path)?.ok_or_else(|| {
+            Error::storage(
+                "prepare default template",
+                format!("{} has no qcow2 backing file", self.path.display()),
+            )
+        })?;
+        if validate_managed_cow_base_backing(&backing)? {
+            return Ok(());
+        }
+        let candidates = managed_template_candidates(K::TEMPLATE_FILENAME);
+        prepare_managed_template(&backing, &candidates)
+            .map_err(|error| Error::storage("prepare default template", error.to_string()))
+    }
+
     /// Get the path to the format marker file for a disk.
     fn disk_marker_path(&self) -> PathBuf {
         self.path.with_extension("formatted")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_managed_cow_base_backing(backing: &Path) -> Result<bool> {
+    validate_cow_base_backing_under(backing, &cow_base_cache_root())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cow_base_backing_under(backing: &Path, root: &Path) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let canonical = backing.canonicalize()?;
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Ok(false);
+    };
+    if !canonical.starts_with(&canonical_root) {
+        return Ok(false);
+    }
+    let metadata = std::fs::metadata(&canonical)?;
+    let manager_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != manager_uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o222 != 0
+        || metadata.permissions().mode() & 0o004 == 0
+    {
+        return Err(Error::storage(
+            "prepare artifact COW base",
+            format!(
+                "{} is not a secure readable immutable base",
+                canonical.display()
+            ),
+        ));
+    }
+    let mut current = canonical.parent();
+    while let Some(directory) = current {
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir()
+            || metadata.uid() != manager_uid
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o001 == 0
+        {
+            return Err(Error::storage(
+                "prepare artifact COW base",
+                format!(
+                    "{} is not a secure manager-owned, traverse-only COW-base directory",
+                    directory.display()
+                ),
+            ));
+        }
+        if directory == canonical_root {
+            break;
+        }
+        current = directory.parent();
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_template_candidates(filename: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let root = home.join(".smolvm");
+        candidates.push((root.join(filename), root));
+    }
+    if let Some(cache) = dirs::cache_dir() {
+        candidates.push((cache.join("smolvm").join(filename), cache));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push((parent.join(filename), parent.to_path_buf()));
+        }
+    }
+    candidates
+}
+
+#[cfg(target_os = "linux")]
+fn read_direct_qcow2_backing(path: &Path) -> Result<Option<PathBuf>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header)?;
+    if header[..4] != *b"QFI\xfb" {
+        return Err(Error::storage(
+            "read qcow2 backing",
+            format!("{} is not a qcow2 image", path.display()),
+        ));
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let size = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    if offset == 0 || size == 0 {
+        return Ok(None);
+    }
+    if size > 4096 {
+        return Err(Error::storage(
+            "read qcow2 backing",
+            "backing filename exceeds 4096 bytes",
+        ));
+    }
+    let mut bytes = vec![0_u8; size as usize];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut bytes)?;
+    let name = String::from_utf8(bytes)
+        .map_err(|_| Error::storage("read qcow2 backing", "backing filename is not UTF-8"))?;
+    let backing = PathBuf::from(name);
+    Ok(Some(if backing.is_absolute() {
+        backing
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(backing)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_managed_template(
+    template: &Path,
+    candidates: &[(PathBuf, PathBuf)],
+) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let canonical = template.canonicalize()?;
+    // Requiring both the requested path and one candidate to already be their
+    // canonical spelling rejects symlinked leaves and ancestor redirection.
+    let traversal_root = candidates.iter().find_map(|(candidate, traversal_root)| {
+        (candidate == &canonical
+            && candidate
+                .canonicalize()
+                .is_ok_and(|candidate_canonical| candidate_canonical == canonical))
+        .then_some(traversal_root)
+    });
+    let Some(traversal_root) = traversal_root else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "qcow2 backing {} is not an exact managed default template; refusing to change its permissions",
+                template.display()
+            ),
+        ));
+    };
+    let canonical_traversal_root = traversal_root.canonicalize()?;
+
+    let manager_uid = unsafe { libc::geteuid() };
+    let parent = canonical.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed template has no parent directory",
+        )
+    })?;
+    if !parent.starts_with(&canonical_traversal_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed template is outside its permitted traversal root",
+        ));
+    }
+
+    // Everything above the selected managed root is unrelated operator-owned
+    // state (for example /root or a user's home). It must already be
+    // traversable and is never chmodded.
+    let mut ancestor = canonical_traversal_root.parent();
+    while let Some(directory) = ancestor {
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o001 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "template ancestor {} is not traversable; refusing to widen an unrelated directory",
+                    directory.display()
+                ),
+            ));
+        }
+        ancestor = directory.parent();
+    }
+
+    // Validate the complete managed chain before changing anything, avoiding
+    // partial permission changes if a deeper component is unsafe.
+    let mut managed_directories = Vec::new();
+    let mut directory = parent;
+    loop {
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir()
+            || metadata.uid() != manager_uid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "managed template directory {} must be manager-owned and not group- or world-writable",
+                    directory.display()
+                ),
+            ));
+        }
+        managed_directories.push((directory.to_path_buf(), metadata.permissions().mode()));
+        if directory == canonical_traversal_root {
+            break;
+        }
+        directory = directory.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed traversal root is not an ancestor of the template",
+            )
+        })?;
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != manager_uid || metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed template must be a regular, singly-linked file owned by the privileged manager",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed template must not be group- or world-writable",
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o444 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+    }
+    for (directory, mode) in managed_directories {
+        if mode & 0o001 == 0 {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode | 0o001))?;
+        }
+    }
+    Ok(())
 }
 
 impl VmDisk<Storage> {
@@ -903,6 +1160,150 @@ mod tests {
             }
         }
         let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_default_template_becomes_readable_without_widening_directory_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let cache_root = temp.path().join("cache");
+        let managed_dir = cache_root.join("smolvm");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let template = managed_dir.join("storage-template.ext4");
+        std::fs::write(&template, b"template").unwrap();
+        std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        prepare_managed_template(&template, &[(template.clone(), cache_root.clone())]).unwrap();
+
+        assert_eq!(
+            template.metadata().unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(
+            managed_dir.metadata().unwrap().permissions().mode() & 0o777,
+            0o701,
+            "dropped VMMs may traverse but not list the managed cache"
+        );
+        assert_eq!(
+            cache_root.metadata().unwrap().permissions().mode() & 0o777,
+            0o701,
+            "the bounded managed cache chain is made traverse-only"
+        );
+        assert_eq!(
+            temp.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o711,
+            "the unrelated ancestor is not modified"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_template_never_widens_an_unrelated_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_dir = temp.path().join("managed");
+        std::fs::create_dir(&managed_dir).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let template = managed_dir.join("storage-template.ext4");
+        std::fs::write(&template, b"template").unwrap();
+        std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = prepare_managed_template(&template, &[(template.clone(), managed_dir.clone())])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            temp.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            template.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn already_readable_immutable_template_needs_no_permission_change() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let managed_dir = temp.path().join("managed");
+        std::fs::create_dir(&managed_dir).unwrap();
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o701)).unwrap();
+        let template = managed_dir.join("storage-template.ext4");
+        std::fs::write(&template, b"template").unwrap();
+        std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        prepare_managed_template(&template, &[(template.clone(), managed_dir)]).unwrap();
+        assert_eq!(
+            template.metadata().unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arbitrary_external_template_is_rejected_without_chmod() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external-template.ext4");
+        std::fs::write(&external, b"external").unwrap();
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let allowed = temp.path().join("storage-template.ext4");
+
+        let error = prepare_managed_template(&external, &[(allowed, temp.path().to_path_buf())])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            external.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "an external qcow2 backing must never be chmodded"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immutable_artifact_cow_base_is_accepted_without_default_template_chmod() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_cow-bases");
+        let leaf = root.join("digest/storage-1");
+        std::fs::create_dir_all(&leaf).unwrap();
+        for directory in [&root, &root.join("digest")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o711)).unwrap();
+        }
+        let base = leaf.join("base.raw");
+        std::fs::write(&base, b"artifact base").unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(validate_cow_base_backing_under(&base, &root).unwrap());
+        assert_eq!(base.metadata().unwrap().permissions().mode() & 0o777, 0o444);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn artifact_cow_base_rejects_a_writable_intervening_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("_cow-bases");
+        let digest = root.join("digest");
+        let leaf = digest.join("storage-1");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711)).unwrap();
+        std::fs::set_permissions(&digest, std::fs::Permissions::from_mode(0o733)).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let base = leaf.join("base.qcow2");
+        std::fs::write(&base, b"artifact base").unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        assert!(validate_cow_base_backing_under(&base, &root).is_err());
+        assert_eq!(
+            digest.metadata().unwrap().permissions().mode() & 0o777,
+            0o733,
+            "validation must not chmod a compromised COW-base chain"
+        );
     }
 
     #[test]

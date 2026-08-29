@@ -2188,6 +2188,16 @@ impl AgentManager {
                         e.to_string(),
                     )
                 })?;
+                // Default-sized disks are qcow2 overlays over SmolVM's shared,
+                // immutable templates. libkrun opens those backing files only
+                // after this subprocess drops to `uid`, so prepare only those
+                // exact managed templates for cross-uid read/traversal. The
+                // storage helper refuses arbitrary external backing paths.
+                #[cfg(target_os = "linux")]
+                {
+                    self.storage_disk.prepare_default_template_for_uid_drop()?;
+                    self.overlay_disk.prepare_default_template_for_uid_drop()?;
+                }
                 crate::process::chown_tree(d, uid, gid)
                     .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
                 #[cfg(target_os = "linux")]
@@ -2345,6 +2355,10 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
+        #[cfg(target_os = "linux")]
+        let scope_mode = std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some();
+        #[cfg(not(target_os = "linux"))]
+        let scope_mode = false;
         let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
@@ -2398,6 +2412,10 @@ impl AgentManager {
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
+            )
+            .env(
+                "SMOLVM_BOOT_SCOPE_BARRIER",
+                if scope_mode { "1" } else { "0" },
             )
             // Forkable / fork-clone vars set explicitly on the child (not via
             // inherited process-global env) — see fork_env above.
@@ -2455,13 +2473,6 @@ impl AgentManager {
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
 
         let child_pid = child.id() as i32;
-        // Register the detached VM PID for the serve supervisor's selective
-        // reaper. The boot subprocess owns its process group and is never
-        // `wait()`ed, so it would zombie on exit; the supervisor tick reaps it.
-        // (In non-serve callers without a supervisor this is a harmless no-op —
-        // the sweep is only driven from serve.) The `child` handle drops without
-        // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
-        crate::process::register_vm_child(child_pid);
         tracing::info!(
             pid = child_pid,
             spawn_ms = spawn_start.elapsed().as_millis(),
@@ -2475,11 +2486,33 @@ impl AgentManager {
         // boot subprocess skipped self-placement and the VM is still in serve's
         // cgroup for this microsecond window — the adopt moves it out. Caps mirror
         // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
-        // =1024) as scope properties. Best-effort: on failure the VM keeps running
-        // (just not restart-safe), same as an uncapped cgroup join.
+        // =1024) as scope properties. Scope mode is an explicit protected-service
+        // contract: adoption failure kills and reaps this exact child rather than
+        // deliberately leaving an uncapped, non-restart-safe VMM alive.
         #[cfg(target_os = "linux")]
-        if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
-            if let Some(name) = self.name() {
+        if scope_mode {
+            if let Err(error) = crate::process::wait_for_vm_child_scope_barrier(
+                child_pid,
+                std::time::Duration::from_secs(5),
+            ) {
+                let terminated =
+                    crate::process::cleanup_after_scope_barrier_error(child_pid, &error);
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Stopped;
+                return Err(Error::agent(
+                    "wait for VM scope barrier",
+                    format!(
+                        "{error}; child {child_pid} {}",
+                        if terminated {
+                            "was terminated"
+                        } else {
+                            "was already reaped"
+                        }
+                    ),
+                ));
+            }
+            let scope_name = self.name().map(str::to_owned);
+            let adoption = if let Some(name) = scope_name.as_deref() {
                 let caps = crate::systemd_scope::ScopeCaps {
                     memory_max_bytes: Some(crate::process::vmm_memory_limit_bytes(
                         resources_for_config.memory_mib,
@@ -2490,18 +2523,47 @@ impl AgentManager {
                     ),
                     tasks_max: Some(1024),
                 };
-                if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
-                    // Only reachable when is_available() said yes (root + systemd +
-                    // busctl) but the bus call still failed — effectively a broken
-                    // D-Bus. The VM keeps running but stays in serve's cgroup,
-                    // uncapped and not restart-safe. Loud so the operator notices.
-                    tracing::warn!(
-                        error = %e, pid = child_pid,
-                        "failed to adopt VM into systemd scope; VM left in service cgroup — uncapped and NOT restart-safe"
-                    );
+                crate::systemd_scope::adopt_into_scope(name, child_pid, &caps)
+            } else {
+                Err(Error::agent("vm scope", "scope mode requires a named VM"))
+            };
+            if let Err(error) = adoption {
+                crate::process::kill_and_reap_unadopted_vm_child(child_pid);
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Stopped;
+                return Err(Error::agent(
+                    "adopt VM into required systemd scope",
+                    format!("{error}; terminated unadopted child {child_pid}"),
+                ));
+            }
+            if let Err(error) = crate::systemd_scope::continue_scope(
+                scope_name
+                    .as_deref()
+                    .expect("scope adoption required a machine name"),
+            ) {
+                let scope_teardown = crate::systemd_scope::kill_scope(
+                    scope_name
+                        .as_deref()
+                        .expect("scope adoption required a machine name"),
+                );
+                if matches!(&scope_teardown, Ok(true)) {
+                    crate::process::reap_vm_child(child_pid);
                 }
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Stopped;
+                return Err(Error::agent(
+                    "release VM scope barrier",
+                    format!("{error}; authoritative scope teardown result: {scope_teardown:?}"),
+                ));
             }
         }
+
+        // Register only after required scope adoption and scope-addressed
+        // SIGCONT succeed. Until then this parent is the sole reaper, so a child
+        // that exits during placement remains a zombie and its numeric PID
+        // cannot be reused during fail-closed cleanup. In non-scope mode this is
+        // still immediate. The serve supervisor reaps the detached child later.
+        crate::process::register_vm_child(child_pid);
 
         self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
     }

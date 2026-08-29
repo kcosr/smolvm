@@ -12,6 +12,28 @@ use smolvm::data::disk::{DiskFormat, DiskType};
 use smolvm::storage::VmDisk;
 use std::path::{Path, PathBuf};
 
+fn write_startup_error(mut stderr: impl std::io::Write, message: &str) -> std::io::Result<()> {
+    writeln!(stderr, "{message}")
+}
+
+/// Report a boot failure through fd 2. The subprocess opened and dup2'd the
+/// startup log before dropping uid, so this remains writable even when the
+/// pathname itself is root-owned and no longer reopenable.
+fn emit_startup_error(message: &str) {
+    let stderr = std::io::stderr();
+    let _ = write_startup_error(stderr.lock(), message);
+}
+
+#[cfg(test)]
+mod startup_error_tests {
+    #[test]
+    fn launch_errors_are_written_to_the_existing_stderr_stream() {
+        let mut output = Vec::new();
+        super::write_startup_error(&mut output, "libkrun launch failed").unwrap();
+        assert_eq!(output, b"libkrun launch failed\n");
+    }
+}
+
 /// Open a boot disk honoring its on-disk format. A fork clone's disk path ends
 /// in `.qcow2` (a copy-on-write overlay, opened as-is over its backing image);
 /// every other disk is a raw image that may need creating/formatting. The path
@@ -30,6 +52,16 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDi
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     let t_proc = std::time::Instant::now();
+
+    // A protected systemd serve process must place this child into its capped
+    // transient scope before any guest setup or KVM execution begins. Stop at
+    // the first instruction boundary; the parent waits with WUNTRACED, adopts
+    // this PID, then SIGCONTs it. The variable is set only for explicit scope
+    // mode, so ordinary CLI/SDK/dev boots are unchanged.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SMOLVM_BOOT_SCOPE_BARRIER").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        unsafe { libc::raise(libc::SIGSTOP) };
+    }
 
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:
@@ -482,10 +514,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     ) {
         Ok(d) => d,
         Err(e) => {
-            let _ = std::fs::write(
-                &config.startup_error_log,
-                format!("failed to open storage disk: {}", e),
-            );
+            emit_startup_error(&format!("failed to open storage disk: {e}"));
             smolvm::process::exit_child(1);
         }
     };
@@ -497,10 +526,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     ) {
         Ok(d) => d,
         Err(e) => {
-            let _ = std::fs::write(
-                &config.startup_error_log,
-                format!("failed to open overlay disk: {}", e),
-            );
+            emit_startup_error(&format!("failed to open overlay disk: {e}"));
             smolvm::process::exit_child(1);
         }
     };
@@ -642,14 +668,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
 
     // If we get here, launch_agent_vm returned (should only happen on error)
     if let Err(ref e) = result {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config.startup_error_log)
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "{e}")
-            });
+        emit_startup_error(&e.to_string());
     }
 
     smolvm::process::exit_child(1);
