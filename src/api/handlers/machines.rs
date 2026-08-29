@@ -44,8 +44,8 @@ use crate::api::state::{
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, EgressEventsResponse,
     ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse,
-    MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec,
-    StartMachineQuery,
+    MachineInfo, MountInfo, MountSpec, PortSpec, PublishedSocketInfo, ResizeMachineRequest,
+    ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -98,6 +98,20 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             .map(|(host, guest)| PortSpec {
                 host: *host,
                 guest: *guest,
+            })
+            .collect(),
+        published_sockets: record
+            .published_sockets
+            .iter()
+            .map(|socket| PublishedSocketInfo {
+                direction: socket.direction.into(),
+                guest_path: socket.guest_path.clone(),
+                host_path: crate::config::effective_published_socket_host_path(
+                    socket,
+                    &vm_data_dir(name),
+                )
+                .to_string_lossy()
+                .into_owned(),
             })
             .collect(),
         network: record.network,
@@ -330,6 +344,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         manager,
         mounts,
         ports,
+        published_sockets: record.published_sockets.clone(),
         resources: ResourceSpec {
             // VmResources carries no hostname allow-list, so graft it back from the
             // record — otherwise a reloaded machine would silently lose allowed_hosts.
@@ -566,6 +581,11 @@ pub async fn create_machine(
     // cap are needed.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+
+    let published_sockets: Vec<crate::config::PublishedSocketConfig> =
+        req.published_sockets.iter().map(Into::into).collect();
+    crate::config::validate_published_sockets(&published_sockets, &vm_data_dir(&name))
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // Split remote volumes (`s3://` sources) from host mounts,
     // mirroring the CLI's -v handling, then validate the host mount paths.
@@ -1075,6 +1095,7 @@ pub async fn create_machine(
         mounts: host_mount_specs,
         remote_volumes,
         ports: restored_ports,
+        published_sockets,
         resources: resources.clone(),
         restart: if let Some(workload) = manifest_checkpoint
             .as_ref()
@@ -3522,6 +3543,62 @@ mod tests {
     }
 
     #[test]
+    fn create_contract_deserializes_typed_published_sockets() {
+        let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "socket-vm",
+            "publishedSockets": [
+                {"direction": "expose", "guestPath": "/run/api.sock"},
+                {
+                    "direction": "mount",
+                    "guestPath": "/run/host.sock",
+                    "hostPath": "/tmp/service.sock"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(request.published_sockets.len(), 2);
+        assert_eq!(
+            request.published_sockets[0].direction,
+            crate::api::types::PublishedSocketDirection::Expose
+        );
+        assert!(request.published_sockets[0].host_path.is_none());
+        assert_eq!(
+            request.published_sockets[1].host_path.as_deref(),
+            Some("/tmp/service.sock")
+        );
+    }
+
+    #[test]
+    fn machine_status_reports_required_effective_published_socket_paths() {
+        let mut record = VmRecord::new("socket-vm".into(), 1, 512, vec![], vec![], false);
+        record.published_sockets = vec![
+            crate::config::PublishedSocketConfig {
+                direction: crate::config::SocketDirection::Expose,
+                guest_path: "/run/api.sock".into(),
+                host_path: None,
+            },
+            crate::config::PublishedSocketConfig {
+                direction: crate::config::SocketDirection::Mount,
+                guest_path: "/run/host.sock".into(),
+                host_path: Some("/tmp/service.sock".into()),
+            },
+        ];
+
+        let info = record_to_info("socket-vm", &record);
+        assert_eq!(info.published_sockets.len(), 2);
+        assert_eq!(
+            info.published_sockets[0].host_path,
+            vm_data_dir("socket-vm").join("api.sock").to_string_lossy()
+        );
+        assert_eq!(info.published_sockets[1].host_path, "/tmp/service.sock");
+        let json = serde_json::to_value(info.published_sockets).unwrap();
+        assert!(json[0]["hostPath"].is_string());
+        assert_eq!(json[0]["direction"], "expose");
+        assert_eq!(json[0]["guestPath"], "/run/api.sock");
+    }
+
+    #[test]
     fn test_record_to_info_with_running_state() {
         let mut record = VmRecord::new("running-vm".to_string(), 1, 512, vec![], vec![], false);
         record.state = RecordState::Running;
@@ -3616,6 +3693,7 @@ mod tests {
             mem: None,
             mounts: vec![],
             ports: vec![],
+            published_sockets: vec![],
             network: false,
             gpu: false,
             cuda: false,

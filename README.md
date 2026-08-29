@@ -154,6 +154,11 @@ smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 ```
 
+The HTTP API can also publish arbitrary Unix sockets in either direction. Its
+machine status responses always report the effective host path, including paths
+defaulted into smolvm's private machine directory; see
+[Published Unix sockets over the HTTP API](docs/published-sockets-api.md).
+
 **Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
 ```bash

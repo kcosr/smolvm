@@ -128,6 +128,8 @@ use state::ApiState;
         types::RestartSpec,
         types::MountSpec,
         types::PortSpec,
+        types::PublishedSocketDirection,
+        types::PublishedSocketSpec,
         types::ResourceSpec,
         types::ExecRequest,
         types::RunRequest,
@@ -163,6 +165,7 @@ use state::ApiState;
         types::EgressDenialInfo,
         types::EgressEventsResponse,
         types::MountInfo,
+        types::PublishedSocketInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
         types::ExportResponse,
@@ -631,7 +634,8 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_id_from_path, normalize_metrics_path, validate_command};
+    use super::{machine_id_from_path, normalize_metrics_path, validate_command, ApiDoc};
+    use utoipa::OpenApi;
 
     #[test]
     fn machine_id_is_extracted_from_machine_routes() {
@@ -677,5 +681,21 @@ mod tests {
         assert!(validate_command(&[]).is_err());
         assert!(validate_command(&["echo".to_string()]).is_ok());
         assert!(validate_command(&["echo".to_string(), "hello".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn openapi_describes_typed_published_socket_contract() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &document["components"]["schemas"];
+        assert!(schemas["PublishedSocketDirection"].is_object());
+        assert!(schemas["PublishedSocketSpec"].is_object());
+        assert!(schemas["PublishedSocketInfo"].is_object());
+        assert!(schemas["CreateMachineRequest"]["properties"]["publishedSockets"].is_object());
+        assert!(schemas["MachineInfo"]["properties"]["publishedSockets"].is_object());
+        assert!(schemas["PublishedSocketInfo"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "hostPath"));
     }
 }

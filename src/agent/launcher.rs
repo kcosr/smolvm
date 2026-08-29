@@ -641,6 +641,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let _ = &pod_net;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    if !published_sockets.is_empty() {
+        let machine_data_dir = vsock_socket.parent().ok_or_else(|| {
+            Error::agent(
+                "validate published sockets",
+                "agent socket has no parent machine data directory",
+            )
+        })?;
+        crate::config::validate_published_sockets(published_sockets, machine_data_dir)?;
+    }
 
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
     // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
@@ -1571,66 +1580,53 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // The per-VM dir (the vsock socket's parent) is where an `expose` socket's
         // host end is created when the user didn't pin a host path.
         let per_vm_dir = vsock_socket.parent();
-        let published_guest: Vec<smolvm_protocol::publish_socket::PublishedSocket> = published_sockets
-            .iter()
-            .take(ports::PUBLISH_SOCKET_MAX)
-            .enumerate()
-            .filter_map(|(i, spec)| {
-                let vsock_port = ports::PUBLISH_SOCKET_BASE + i as u32;
-                // Resolve the host-side path: explicit, or (expose only) the
-                // per-VM dir + the guest socket's basename.
-                let host_path: std::path::PathBuf = match &spec.host_path {
-                    Some(p) => std::path::PathBuf::from(p),
-                    None => {
-                        let base = std::path::Path::new(&spec.guest_path)
-                            .file_name()
-                            .unwrap_or_else(|| std::ffi::OsStr::new("published.sock"));
-                        match per_vm_dir {
-                            Some(dir) => dir.join(base),
-                            None => {
-                                tracing::warn!(
-                                    guest_path = %spec.guest_path,
-                                    "published socket has no host path and no per-VM dir; skipping"
-                                );
-                                return None;
-                            }
-                        }
-                    }
-                };
-                // For an expose socket libkrun *creates* the host listener, so
-                // clear any stale file first (mirrors the Docker bridge).
-                if spec.direction.host_listens() {
-                    let _ = std::fs::remove_file(&host_path);
-                }
-                let host_c = match path_to_cstring(&host_path) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        tracing::warn!(host_path = %host_path.display(), "published socket host path has a null byte; skipping");
-                        return None;
-                    }
-                };
-                if krun_add_vsock_port2(ctx, vsock_port, host_c.as_ptr(), spec.direction.host_listens()) < 0 {
-                    tracing::warn!(
-                        vsock_port,
-                        host_path = %host_path.display(),
-                        "failed to add published socket vsock port — disabled"
-                    );
-                    return None;
-                }
-                tracing::info!(
-                    vsock_port,
-                    direction = spec.direction.as_str(),
-                    host_path = %host_path.display(),
-                    guest_path = %spec.guest_path,
-                    "published socket bridge enabled"
-                );
-                Some(smolvm_protocol::publish_socket::PublishedSocket {
-                    vsock_port,
-                    guest_path: spec.guest_path.clone(),
-                    direction: spec.direction,
-                })
-            })
-            .collect();
+        let mut published_guest = Vec::with_capacity(published_sockets.len());
+        for (i, spec) in published_sockets.iter().enumerate() {
+            let vsock_port = ports::PUBLISH_SOCKET_BASE + i as u32;
+            // Resolve the host-side path: explicit, or (expose only) the
+            // per-VM dir + the guest socket's basename.
+            let per_vm_dir = per_vm_dir.expect("published sockets validated with parent dir");
+            let host_path = crate::config::effective_published_socket_host_path(spec, per_vm_dir);
+            // For an expose socket libkrun *creates* the host listener, so
+            // clear any stale file first (mirrors the Docker bridge).
+            if spec.direction.host_listens() {
+                let _ = std::fs::remove_file(&host_path);
+            }
+            let host_c = try_or_free_ctx!(
+                path_to_cstring(&host_path),
+                "add published socket",
+                "validated host path contains null byte"
+            );
+            if krun_add_vsock_port2(
+                ctx,
+                vsock_port,
+                host_c.as_ptr(),
+                spec.direction.host_listens(),
+            ) < 0
+            {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add published socket",
+                    format!(
+                        "krun_add_vsock_port2 failed for {} at '{}'",
+                        spec.guest_path,
+                        host_path.display()
+                    ),
+                ));
+            }
+            tracing::info!(
+                vsock_port,
+                direction = spec.direction.as_str(),
+                host_path = %host_path.display(),
+                guest_path = %spec.guest_path,
+                "published socket bridge enabled"
+            );
+            published_guest.push(smolvm_protocol::publish_socket::PublishedSocket {
+                vsock_port,
+                guest_path: spec.guest_path.clone(),
+                direction: spec.direction,
+            });
+        }
 
         // Redirect console output to a file if specified, via the upstream
         // virtio-console API (krun_set_console_output was removed).

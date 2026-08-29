@@ -183,54 +183,10 @@ fn parse_published_sockets(
             host_path: Some(host_path.to_string()),
         });
     }
-    if out.len() > smolvm_protocol::ports::PUBLISH_SOCKET_MAX {
-        return Err(smolvm::Error::config(
-            "publish-socket",
-            format!(
-                "too many published sockets ({}); max is {}",
-                out.len(),
-                smolvm_protocol::ports::PUBLISH_SOCKET_MAX
-            ),
-        ));
-    }
-    // The guest env encoding uses ';' and '|' as separators; reject paths that
-    // would corrupt it.
-    for s in &out {
-        if s.guest_path.contains(';') || s.guest_path.contains('|') {
-            return Err(smolvm::Error::config(
-                "publish-socket",
-                format!(
-                    "guest path '{}' contains an unsupported character (';' or '|')",
-                    s.guest_path
-                ),
-            ));
-        }
-        // The guest resolves this path in its own namespace (and bind-mounts a
-        // mounted socket there), so a relative path would silently land next to
-        // whatever the resolving process happens to be rooted at.
-        if !s.guest_path.starts_with('/') {
-            return Err(smolvm::Error::config(
-                "publish-socket",
-                format!("guest path '{}' must be absolute", s.guest_path),
-            ));
-        }
-    }
-    // Two mount bridges at the same guest path silently shadow each other in
-    // the guest, the later bind mount wins, leaving the first bridge's host
-    // socket unreachable. Reject the config instead of paying out a dead
-    // bridge. (Expose entries only *dial* their guest path, so duplicates
-    // there are harmless.)
-    let mut mounted_paths = std::collections::HashSet::new();
-    for s in &out {
-        if s.direction == smolvm::config::SocketDirection::Mount
-            && !mounted_paths.insert(&s.guest_path)
-        {
-            return Err(smolvm::Error::config(
-                "mount-socket",
-                format!("guest path '{}' is mounted more than once", s.guest_path),
-            ));
-        }
-    }
+    // Only the basename matters for a defaulted expose endpoint, so an empty
+    // base directory is sufficient here. Named create validates the same
+    // durable shape again against its real machine directory before launch.
+    smolvm::config::validate_published_sockets(&out, std::path::Path::new(""))?;
     Ok(out)
 }
 

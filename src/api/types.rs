@@ -73,6 +73,73 @@ pub struct PortSpec {
     pub guest: u16,
 }
 
+/// Direction of a published Unix-socket bridge.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PublishedSocketDirection {
+    /// Expose a guest-listening socket at a host path.
+    Expose,
+    /// Mount a host-listening socket at a guest path.
+    Mount,
+}
+
+impl From<PublishedSocketDirection> for crate::config::SocketDirection {
+    fn from(direction: PublishedSocketDirection) -> Self {
+        match direction {
+            PublishedSocketDirection::Expose => Self::Expose,
+            PublishedSocketDirection::Mount => Self::Mount,
+        }
+    }
+}
+
+impl From<crate::config::SocketDirection> for PublishedSocketDirection {
+    fn from(direction: crate::config::SocketDirection) -> Self {
+        match direction {
+            crate::config::SocketDirection::Expose => Self::Expose,
+            crate::config::SocketDirection::Mount => Self::Mount,
+        }
+    }
+}
+
+/// Published Unix-socket bridge requested at machine creation.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishedSocketSpec {
+    /// Bridge direction: `expose` (guest to host) or `mount` (host to guest).
+    pub direction: PublishedSocketDirection,
+    /// Absolute path of the socket inside the guest.
+    #[schema(example = "/run/app.sock")]
+    pub guest_path: String,
+    /// Host socket path. Required for `mount`; optional for `expose`, where it
+    /// defaults to the guest basename in the machine's private data directory.
+    #[serde(default)]
+    #[schema(example = "/tmp/app.sock")]
+    pub host_path: Option<String>,
+}
+
+impl From<&PublishedSocketSpec> for crate::config::PublishedSocketConfig {
+    fn from(socket: &PublishedSocketSpec) -> Self {
+        Self {
+            direction: socket.direction.into(),
+            guest_path: socket.guest_path.clone(),
+            host_path: socket.host_path.clone(),
+        }
+    }
+}
+
+/// Published Unix-socket bridge reported in machine status.
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedSocketInfo {
+    /// Bridge direction.
+    pub direction: PublishedSocketDirection,
+    /// Absolute path of the socket inside the guest.
+    pub guest_path: String,
+    /// Effective host path clients should connect to. Always present, including
+    /// when create omitted it and smolvm selected the per-machine default.
+    pub host_path: String,
+}
+
 /// VM resource specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -535,6 +602,9 @@ pub struct CreateMachineRequest {
     /// Port mappings (host:guest).
     #[serde(default)]
     pub ports: Vec<PortSpec>,
+    /// Unix-socket bridges to publish between the guest and host.
+    #[serde(default)]
+    pub published_sockets: Vec<PublishedSocketSpec>,
     /// Enable outbound network access (TSI).
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
@@ -659,6 +729,8 @@ pub struct MachineInfo {
     pub mounts: Vec<MountInfo>,
     /// Configured port mappings.
     pub ports: Vec<PortSpec>,
+    /// Configured Unix-socket bridges with fully resolved host paths.
+    pub published_sockets: Vec<PublishedSocketInfo>,
     /// Whether outbound network access is enabled.
     pub network: bool,
     /// Whether Vulkan/graphics GPU acceleration is enabled for this machine.

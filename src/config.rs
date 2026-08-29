@@ -33,6 +33,151 @@ pub struct PublishedSocketConfig {
     pub host_path: Option<String>,
 }
 
+/// Resolve the host endpoint used by a published-socket bridge.
+///
+/// Explicit paths are used verbatim. An exposed guest socket with no explicit
+/// host path is published in the machine's private data directory under the
+/// guest socket basename. Keeping this resolver shared prevents launch and
+/// status responses from disagreeing about the path clients should dial.
+pub fn effective_published_socket_host_path(
+    socket: &PublishedSocketConfig,
+    machine_data_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    socket.host_path.as_ref().map_or_else(
+        || {
+            let basename = std::path::Path::new(&socket.guest_path)
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("published.sock"));
+            machine_data_dir.join(basename)
+        },
+        std::path::PathBuf::from,
+    )
+}
+
+/// Validate durable user-published socket configuration.
+///
+/// The CLI, HTTP API, and launcher all consume this exact shape. Listener
+/// endpoints must be unique: expose bridges create host listeners, while mount
+/// bridges create guest listeners. Duplicate dial targets remain valid (for
+/// example mounting one host service at two distinct guest paths).
+pub fn validate_published_sockets(
+    sockets: &[PublishedSocketConfig],
+    machine_data_dir: &std::path::Path,
+) -> Result<()> {
+    if sockets.len() > smolvm_protocol::ports::PUBLISH_SOCKET_MAX {
+        return Err(crate::Error::config(
+            "publish-socket",
+            format!(
+                "too many published sockets ({}); max is {}",
+                sockets.len(),
+                smolvm_protocol::ports::PUBLISH_SOCKET_MAX
+            ),
+        ));
+    }
+
+    let mut host_listeners = std::collections::HashSet::new();
+    let mut host_dial_targets = std::collections::HashSet::new();
+    let mut guest_listeners = std::collections::HashSet::new();
+    let mut guest_dial_targets = std::collections::HashSet::new();
+    for socket in sockets {
+        if socket.guest_path.contains(';')
+            || socket.guest_path.contains('|')
+            || socket.guest_path.contains('\0')
+        {
+            return Err(crate::Error::config(
+                "publish-socket",
+                format!(
+                    "guest path '{}' contains an unsupported character",
+                    socket.guest_path
+                ),
+            ));
+        }
+        // Guest paths are Linux paths even when the host is Windows.
+        if !socket.guest_path.starts_with('/') {
+            return Err(crate::Error::config(
+                "publish-socket",
+                format!("guest path '{}' must be absolute", socket.guest_path),
+            ));
+        }
+        if let Some(host_path) = socket.host_path.as_deref() {
+            if host_path.is_empty() {
+                return Err(crate::Error::config(
+                    "publish-socket",
+                    "host path must not be empty",
+                ));
+            }
+            if host_path.contains('\0') {
+                return Err(crate::Error::config(
+                    "publish-socket",
+                    "host path must not contain a NUL byte",
+                ));
+            }
+            if !std::path::Path::new(host_path).is_absolute() {
+                return Err(crate::Error::config(
+                    "publish-socket",
+                    format!("host path '{host_path}' must be absolute"),
+                ));
+            }
+        }
+
+        match socket.direction {
+            SocketDirection::Expose => {
+                let endpoint = effective_published_socket_host_path(socket, machine_data_dir);
+                if !host_listeners.insert(endpoint.clone()) {
+                    return Err(crate::Error::config(
+                        "expose-socket",
+                        format!(
+                            "two exposed sockets resolve to the same host endpoint '{}'",
+                            endpoint.display()
+                        ),
+                    ));
+                }
+                guest_dial_targets.insert(socket.guest_path.clone());
+            }
+            SocketDirection::Mount => {
+                if socket.host_path.is_none() {
+                    return Err(crate::Error::config(
+                        "mount-socket",
+                        format!(
+                            "host path is required for mounted guest socket '{}'",
+                            socket.guest_path
+                        ),
+                    ));
+                }
+                if !guest_listeners.insert(socket.guest_path.clone()) {
+                    return Err(crate::Error::config(
+                        "mount-socket",
+                        format!(
+                            "two mounted sockets resolve to the same guest path '{}'",
+                            socket.guest_path
+                        ),
+                    ));
+                }
+                host_dial_targets.insert(std::path::PathBuf::from(
+                    socket.host_path.as_deref().expect("validated above"),
+                ));
+            }
+        }
+    }
+
+    if let Some(endpoint) = host_listeners.intersection(&host_dial_targets).next() {
+        return Err(crate::Error::config(
+            "publish-socket",
+            format!(
+                "published sockets use '{}' as both a host listener and dial target",
+                endpoint.display()
+            ),
+        ));
+    }
+    if let Some(endpoint) = guest_listeners.intersection(&guest_dial_targets).next() {
+        return Err(crate::Error::config(
+            "publish-socket",
+            format!("published sockets use '{endpoint}' as both a guest listener and dial target"),
+        ));
+    }
+    Ok(())
+}
+
 /// VM lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1543,5 +1688,133 @@ mod tests {
             back.vm_resources().effective_gpu_vram_mib(),
             crate::data::resources::DEFAULT_GPU_VRAM_MIB,
         );
+    }
+
+    #[test]
+    fn published_socket_validation_and_effective_paths_are_shared() {
+        let machine_dir = std::path::Path::new("/var/lib/smolvm/vms/abc");
+        let exposed = PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path: "/run/services/api.sock".into(),
+            host_path: None,
+        };
+        assert_eq!(
+            effective_published_socket_host_path(&exposed, machine_dir),
+            machine_dir.join("api.sock")
+        );
+        assert!(validate_published_sockets(&[exposed.clone()], machine_dir).is_ok());
+
+        let basename_collision = PublishedSocketConfig {
+            guest_path: "/run/other/api.sock".into(),
+            ..exposed.clone()
+        };
+        assert!(
+            validate_published_sockets(&[exposed.clone(), basename_collision], machine_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("same host endpoint")
+        );
+
+        let relative = PublishedSocketConfig {
+            guest_path: "run/api.sock".into(),
+            ..exposed
+        };
+        assert!(validate_published_sockets(&[relative], machine_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("must be absolute"));
+    }
+
+    #[test]
+    fn published_socket_validation_rejects_mount_collisions_and_limits() {
+        let machine_dir = std::path::Path::new("/var/lib/smolvm/vms/abc");
+        let mounted = PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: "/run/host.sock".into(),
+            host_path: Some("/run/service.sock".into()),
+        };
+        let duplicate = PublishedSocketConfig {
+            host_path: Some("/run/other.sock".into()),
+            ..mounted.clone()
+        };
+        assert!(
+            validate_published_sockets(&[mounted.clone(), duplicate], machine_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("same guest path")
+        );
+
+        let too_many = vec![mounted; smolvm_protocol::ports::PUBLISH_SOCKET_MAX + 1];
+        assert!(validate_published_sockets(&too_many, machine_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("too many published sockets"));
+    }
+
+    #[test]
+    fn published_socket_validation_rejects_cross_direction_and_invalid_host_paths() {
+        let machine_dir = std::path::Path::new("/var/lib/smolvm/vms/abc");
+        let exposed = PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path: "/run/app.sock".into(),
+            host_path: Some("/run/service.sock".into()),
+        };
+        let mounted_host_collision = PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: "/run/host.sock".into(),
+            host_path: Some("/run/service.sock".into()),
+        };
+        assert!(validate_published_sockets(
+            &[exposed.clone(), mounted_host_collision],
+            machine_dir
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("both a host listener and dial target"));
+
+        let mounted_guest_collision = PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: exposed.guest_path.clone(),
+            host_path: Some("/run/other.sock".into()),
+        };
+        assert!(
+            validate_published_sockets(&[exposed, mounted_guest_collision], machine_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("both a guest listener and dial target")
+        );
+
+        for host_path in ["relative.sock", "", "/run/bad\0.sock"] {
+            let invalid = PublishedSocketConfig {
+                direction: SocketDirection::Mount,
+                guest_path: "/run/host.sock".into(),
+                host_path: Some(host_path.into()),
+            };
+            assert!(validate_published_sockets(&[invalid], machine_dir).is_err());
+        }
+
+        let valid_shared_dial_targets = [
+            PublishedSocketConfig {
+                direction: SocketDirection::Mount,
+                guest_path: "/run/host-a.sock".into(),
+                host_path: Some("/run/shared.sock".into()),
+            },
+            PublishedSocketConfig {
+                direction: SocketDirection::Mount,
+                guest_path: "/run/host-b.sock".into(),
+                host_path: Some("/run/shared.sock".into()),
+            },
+            PublishedSocketConfig {
+                direction: SocketDirection::Expose,
+                guest_path: "/run/app.sock".into(),
+                host_path: Some("/run/app-a.sock".into()),
+            },
+            PublishedSocketConfig {
+                direction: SocketDirection::Expose,
+                guest_path: "/run/app.sock".into(),
+                host_path: Some("/run/app-b.sock".into()),
+            },
+        ];
+        assert!(validate_published_sockets(&valid_shared_dial_targets, machine_dir).is_ok());
     }
 }

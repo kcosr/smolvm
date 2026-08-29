@@ -97,6 +97,8 @@ pub struct MachineEntry {
     pub mounts: Vec<MountSpec>,
     /// Port mappings configured for this machine.
     pub ports: Vec<PortSpec>,
+    /// Published Unix-socket bridges configured for this machine.
+    pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
     /// VM resources configured for this machine.
     pub resources: ResourceSpec,
     /// Restart configuration for this machine.
@@ -133,6 +135,8 @@ pub struct MachineRegistration {
     pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,
+    /// Published Unix-socket bridges to persist.
+    pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
     /// VM resources to configure.
     pub resources: ResourceSpec,
     /// Restart configuration.
@@ -472,6 +476,7 @@ impl ApiState {
                             manager,
                             mounts,
                             ports,
+                            published_sockets: record.published_sockets.clone(),
                             resources,
                             restart: record.restart.clone(),
                             network: record.network,
@@ -911,6 +916,7 @@ impl ApiState {
             reg.restart.clone(),
         );
         record.storage_gb = reg.resources.storage_gb;
+        record.published_sockets = reg.published_sockets.clone();
         record.overlay_gb = reg.resources.overlay_gb;
         // Persist egress policy + backend selection from the request (previously
         // dropped here, so API-created machines silently lost both).
@@ -966,6 +972,7 @@ impl ApiState {
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
+                        published_sockets: reg.published_sockets,
                         resources: reg.resources,
                         restart: reg.restart,
                         network: reg.network,
@@ -1600,7 +1607,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let disk_used_mb = crate::agent::disk_used_mb(&name);
 
     MachineInfo {
-        name,
+        name: name.clone(),
         state: state.to_string(),
         cpus: entry.resources.cpus.unwrap_or(1),
         mem: entry.resources.memory_mb.unwrap_or(512),
@@ -1617,6 +1624,20 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             })
             .collect(),
         ports: entry.ports.clone(),
+        published_sockets: entry
+            .published_sockets
+            .iter()
+            .map(|socket| crate::api::types::PublishedSocketInfo {
+                direction: socket.direction.into(),
+                guest_path: socket.guest_path.clone(),
+                host_path: crate::config::effective_published_socket_host_path(
+                    socket,
+                    &crate::agent::vm_data_dir(&name),
+                )
+                .to_string_lossy()
+                .into_owned(),
+            })
+            .collect(),
         network: entry.network,
         gpu: entry.resources.gpu.unwrap_or(false),
         cuda: entry.resources.cuda.unwrap_or(false),
@@ -1766,6 +1787,7 @@ mod tests {
                 manager,
                 mounts: vec![],
                 ports: vec![],
+                published_sockets: vec![],
                 resources: ResourceSpec {
                     cpus: None,
                     memory_mb: None,
@@ -1833,6 +1855,7 @@ mod tests {
                 manager,
                 mounts: vec![],
                 ports: vec![],
+                published_sockets: vec![],
                 resources: ResourceSpec {
                     cpus: None,
                     memory_mb: None,

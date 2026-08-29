@@ -569,6 +569,60 @@ run_test "API: from + image conflict" test_api_from_and_image_conflict || true
 run_test "API: from nonexistent sidecar" test_api_from_nonexistent_sidecar || true
 
 # =============================================================================
+# Published Unix-socket create/status contract
+# =============================================================================
+
+test_api_published_sockets_contract() {
+    local name="api-published-sockets-$$"
+    local explicit="/tmp/${name}-host.sock"
+    local response
+    response=$("${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"$name\",\"publishedSockets\":[{\"direction\":\"expose\",\"guestPath\":\"/run/api.sock\"},{\"direction\":\"mount\",\"guestPath\":\"/run/host.sock\",\"hostPath\":\"$explicit\"}]}" ) || {
+        echo "FAIL: published-socket create failed: $response"
+        return 1
+    }
+
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].direction')" == "expose" ]] || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].guestPath')" == "/run/api.sock" ]] || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == /*/api.sock ]] || {
+        echo "FAIL: defaulted hostPath was not resolved: $response"
+        return 1
+    }
+    [[ "$(echo "$response" | jq -r '.publishedSockets[1].hostPath')" == "$explicit" ]] || return 1
+
+    # The requested shape is durable, while status keeps reporting the effective
+    # default after the serve process reconstructs state from VmRecord.
+    stop_server
+    start_server || return 1
+    response=$("${CURL[@]}" -sf "$API_URL/api/v1/machines/$name") || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == /*/api.sock ]] || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[1].hostPath')" == "$explicit" ]] || return 1
+    "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$name" >/dev/null || return 1
+}
+
+test_api_published_sockets_validation() {
+    local status payload
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"socket-relative","publishedSockets":[{"direction":"expose","guestPath":"run/api.sock"}]}')
+    [[ "$status" == "400" ]] || { echo "FAIL: relative guest path returned $status"; return 1; }
+
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"socket-collision","publishedSockets":[{"direction":"expose","guestPath":"/run/a/api.sock"},{"direction":"expose","guestPath":"/run/b/api.sock"}]}')
+    [[ "$status" == "400" ]] || { echo "FAIL: endpoint collision returned $status"; return 1; }
+
+    payload=$(jq -nc '[range(65) | {direction:"expose", guestPath:("/run/socket-" + (.|tostring) + ".sock")}] | {name:"socket-limit", publishedSockets:.}')
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" -d "$payload")
+    [[ "$status" == "400" ]] || { echo "FAIL: socket limit returned $status"; return 1; }
+}
+
+run_test "API: published sockets persist with effective host paths" test_api_published_sockets_contract || true
+run_test "API: published socket validation" test_api_published_sockets_validation || true
+
+# =============================================================================
 # Created-state machines survive server restart
 # =============================================================================
 
