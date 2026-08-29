@@ -1204,34 +1204,29 @@ where
 
 /// Build `LaunchFeatures` for an API-driven machine start.
 ///
-/// Thin wrapper over [`crate::agent::LaunchFeatures::with_packed_layers`]
-/// — the single source of truth shared with the CLI and embedded start paths.
+/// Thin wrapper over [`crate::agent::LaunchFeatures::with_packed_layers`] and
+/// the single record-to-features source of truth for every API boot path.
 /// When the machine was created from a `.smolmachine` artifact
 /// (`source_smolmachine` is set), its pre-extracted OCI layers — extracted into
 /// the machine's own data dir at create time, keyed by `machine_name` — are
 /// mounted via virtiofs so the guest uses them instead of pulling from a
-/// registry; otherwise default features are returned. Without it the three API
-/// start entrypoints (`start_machine`, `ensure_machine_running`, supervisor
-/// restart) would pass `packed_layers_dir = None` and the guest would fall back
-/// to a network pull. Performs blocking filesystem work — call from within a
-/// `spawn_blocking` context.
-pub fn build_launch_features(
-    machine_name: Option<&str>,
-    source_smolmachine: Option<&str>,
-    dns_filter_hosts: Option<Vec<String>>,
-) -> crate::Result<crate::agent::LaunchFeatures> {
-    let features = crate::agent::LaunchFeatures::default();
-    let mut features = match machine_name {
-        Some(name) => features.with_packed_layers(
-            &crate::agent::machine_layers_cache_dir(name),
-            source_smolmachine,
-        )?,
-        None => features,
-    };
+/// registry. It also carries every durable published socket and validates its
+/// effective host endpoint before the subprocess can touch runtime sockets.
+/// Performs blocking filesystem work — call from a `spawn_blocking` context.
+pub fn build_launch_features(record: &VmRecord) -> crate::Result<crate::agent::LaunchFeatures> {
+    let mut features = crate::agent::LaunchFeatures::default().with_packed_layers(
+        &crate::agent::machine_layers_cache_dir(&record.name),
+        record.source_smolmachine.as_deref(),
+    )?;
     // Carry the egress hostname allow-list into the boot config; `internal_boot`
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
-    features.dns_filter_hosts = dns_filter_hosts;
+    features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    features.published_sockets = record.published_sockets.clone();
+    crate::config::validate_published_sockets(
+        &features.published_sockets,
+        &crate::agent::vm_data_dir(&record.name),
+    )?;
     Ok(features)
 }
 
@@ -1250,6 +1245,7 @@ pub fn build_launch_features(
 /// workload launched.
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+    record: VmRecord,
 ) -> crate::Result<bool> {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
@@ -1264,29 +1260,12 @@ pub async fn ensure_machine_running(
 
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         //
-        // Build the packed-layers features only when the VM is not already up.
-        // This preflight runs on every implicit-start request (exec/run/files/
-        // images); when the VM is already running `ensure_running_via_subprocess`
-        // returns early (discarding `features`) as long as the mount/port/resource
-        // config is unchanged. Acquiring the layers lease on that hot path is
-        // wasted work — on macOS it re-mounts the case-sensitive volume via
-        // hdiutil — so gate it on the same already-running check.
-        //
-        // The gated `default()` is safe across the relaunch branch too: if the
-        // preflight detects a mount/port/resource change and restarts the VM,
-        // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
-        // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
-        // restart keeps using them instead of falling back to a registry pull.
+        // Build the complete durable launch feature set even on the already-up
+        // preflight. `ensure_running_via_subprocess` discards it when no restart
+        // is needed, but if a config change causes a relaunch it must carry every
+        // record-backed capability, including published sockets.
         let already_up = entry.manager.try_connect_existing().is_some();
-        let mut features = if already_up {
-            crate::agent::LaunchFeatures::default()
-        } else {
-            build_launch_features(
-                entry.manager.name(),
-                entry.source_smolmachine.as_deref(),
-                entry.resources.allowed_hosts.clone(),
-            )?
-        };
+        let mut features = build_launch_features(&record)?;
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
@@ -1327,7 +1306,12 @@ pub async fn ensure_running_and_persist(
     // launches with pre-update mounts/ports/resources. `update` refuses
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
-    if let Ok(Some(record)) = state.lookup_vm(name).await {
+    let record = state
+        .lookup_vm(name)
+        .await
+        .map_err(|error| crate::Error::agent("load machine record", format!("{error:?}")))?
+        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+    {
         let mut e = entry.lock();
         e.mounts = record
             .mounts
@@ -1346,6 +1330,7 @@ pub async fn ensure_running_and_persist(
                 guest: *guest,
             })
             .collect();
+        e.published_sockets = record.published_sockets.clone();
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
@@ -1354,7 +1339,7 @@ pub async fn ensure_running_and_persist(
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
 
-    let freshly_booted = ensure_machine_running(entry).await?;
+    let freshly_booted = ensure_machine_running(entry, record).await?;
 
     let pid = {
         let entry = entry.lock();
@@ -1745,16 +1730,57 @@ mod tests {
     }
 
     #[test]
-    fn build_launch_features_carries_allowed_hosts() {
+    fn build_launch_features_carries_record_backed_boot_capabilities() {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let sockets = vec![crate::config::PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/api.sock".into(),
+            host_path: None,
+        }];
+        let mut record = VmRecord::new("launch-features".into(), 1, 512, vec![], vec![], false);
+        record.dns_filter_hosts = Some(hosts.clone());
+        record.published_sockets = sockets.clone();
+        let features = build_launch_features(&record).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
+        assert_eq!(features.published_sockets, sockets);
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        record.dns_filter_hosts = None;
+        record.published_sockets.clear();
+        let features = build_launch_features(&record).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
+        assert!(features.published_sockets.is_empty());
+    }
+
+    #[test]
+    fn persisted_record_reloads_published_sockets_into_api_boot_features() {
+        let (_dir, state) = temp_api_state();
+        let mut record = VmRecord::new("socket-reload".into(), 1, 512, vec![], vec![], false);
+        record.published_sockets = vec![crate::config::PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/agent-workspaces/agent.sock".into(),
+            host_path: None,
+        }];
+        state.db.insert_vm(&record.name, &record).unwrap();
+
+        // Explicit start, implicit start, supervisor restart, and prepared-fork
+        // boot all call this record-only builder. Reload from SQLite first so
+        // the assertion covers the durable create -> server reload path rather
+        // than an in-memory request object.
+        let reloaded = state.db.get_vm(&record.name).unwrap().unwrap();
+        let features = build_launch_features(&reloaded).unwrap();
+        assert_eq!(features.published_sockets, record.published_sockets);
+        assert_eq!(
+            crate::config::effective_published_socket_host_path(
+                &features.published_sockets[0],
+                &crate::agent::vm_data_dir(&record.name),
+            ),
+            crate::agent::vm_data_dir(&record.name)
+                .join("published-sockets")
+                .join("agent.sock")
+        );
     }
 
     #[test]

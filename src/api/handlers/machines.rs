@@ -1495,24 +1495,19 @@ pub async fn start_machine(
     let name_clone = name.clone();
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
-    let source_smolmachine = record.source_smolmachine.clone();
-    let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
+    let feature_record = record.clone();
     let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         // Wire pre-extracted layers if this machine was created from a .smolmachine.
-        let mut features = crate::api::state::build_launch_features(
-            Some(&name_clone),
-            source_smolmachine.as_deref(),
-            dns_filter_hosts,
-        )
-        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        let mut features = crate::api::state::build_launch_features(&feature_record)
+            .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // A fork clone shares its golden's uid. On a cold (re)start there is no
         // snapshot path to resolve it from, so pass the golden's data dir
         // explicitly — without it the clone claims a fresh uid that cannot
@@ -2115,12 +2110,8 @@ async fn boot_prepared_fork_inner(
             AgentManager::for_vm_with_sizes(&clone_b, record.storage_gb, record.overlay_gb)
                 .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
-        let mut features = crate::api::state::build_launch_features(
-            Some(&clone_b),
-            record.source_smolmachine.as_deref(),
-            record.dns_filter_hosts.clone(),
-        )
-        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        let mut features = crate::api::state::build_launch_features(&record)
+            .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.forkable = record.forkable;
         features.snapshot_dir = Some(prep.snapshot_dir);
@@ -3589,7 +3580,9 @@ mod tests {
         assert_eq!(info.published_sockets.len(), 2);
         assert_eq!(
             info.published_sockets[0].host_path,
-            vm_data_dir("socket-vm").join("api.sock").to_string_lossy()
+            vm_data_dir("socket-vm")
+                .join("published-sockets/api.sock")
+                .to_string_lossy()
         );
         assert_eq!(info.published_sockets[1].host_path, "/tmp/service.sock");
         let json = serde_json::to_value(info.published_sockets).unwrap();

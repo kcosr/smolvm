@@ -22,9 +22,9 @@ Unix sockets between the host and guest:
 
 `direction: "expose"` makes a socket listened to in the guest reachable from
 the host. Its `hostPath` is optional; when omitted, smolvm uses the guest socket
-basename in the machine's private data directory. `direction: "mount"` makes an
-existing host-listening socket reachable in the guest and therefore requires
-`hostPath`.
+basename in a protected `published-sockets` subdirectory of the machine's
+private data directory. `direction: "mount"` makes an existing host-listening
+socket reachable in the guest and therefore requires `hostPath`.
 
 Create, get, and list responses return the same `direction` and `guestPath`, plus
 a required `hostPath` containing the effective path. Callers should use that
@@ -36,7 +36,7 @@ reported path rather than deriving smolvm's private machine directory layout:
     {
       "direction": "expose",
       "guestPath": "/run/worker.sock",
-      "hostPath": "/home/me/.cache/smolvm/vms/0123456789abcdef/worker.sock"
+      "hostPath": "/home/me/.cache/smolvm/vms/0123456789abcdef/published-sockets/worker.sock"
     }
   ]
 }

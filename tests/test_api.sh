@@ -578,14 +578,14 @@ test_api_published_sockets_contract() {
     local response
     response=$("${CURL[@]}" -sf -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
-        -d "{\"name\":\"$name\",\"publishedSockets\":[{\"direction\":\"expose\",\"guestPath\":\"/run/api.sock\"},{\"direction\":\"mount\",\"guestPath\":\"/run/host.sock\",\"hostPath\":\"$explicit\"}]}" ) || {
+        -d "{\"name\":\"$name\",\"publishedSockets\":[{\"direction\":\"expose\",\"guestPath\":\"/run/agent-workspaces/agent.sock\"},{\"direction\":\"mount\",\"guestPath\":\"/run/host.sock\",\"hostPath\":\"$explicit\"}]}" ) || {
         echo "FAIL: published-socket create failed: $response"
         return 1
     }
 
     [[ "$(echo "$response" | jq -r '.publishedSockets[0].direction')" == "expose" ]] || return 1
-    [[ "$(echo "$response" | jq -r '.publishedSockets[0].guestPath')" == "/run/api.sock" ]] || return 1
-    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == /*/api.sock ]] || {
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].guestPath')" == "/run/agent-workspaces/agent.sock" ]] || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == */published-sockets/agent.sock ]] || {
         echo "FAIL: defaulted hostPath was not resolved: $response"
         return 1
     }
@@ -596,7 +596,7 @@ test_api_published_sockets_contract() {
     stop_server
     start_server || return 1
     response=$("${CURL[@]}" -sf "$API_URL/api/v1/machines/$name") || return 1
-    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == /*/api.sock ]] || return 1
+    [[ "$(echo "$response" | jq -r '.publishedSockets[0].hostPath')" == */published-sockets/agent.sock ]] || return 1
     [[ "$(echo "$response" | jq -r '.publishedSockets[1].hostPath')" == "$explicit" ]] || return 1
     "${CURL[@]}" -sf -X DELETE "$API_URL/api/v1/machines/$name" >/dev/null || return 1
 }

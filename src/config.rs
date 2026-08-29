@@ -33,6 +33,18 @@ pub struct PublishedSocketConfig {
     pub host_path: Option<String>,
 }
 
+/// VM-private namespace for defaulted published-socket host listeners.
+///
+/// Runtime control endpoints live directly in the machine data directory, so
+/// user listeners must never share that namespace: a guest socket named
+/// `agent.sock` would otherwise resolve onto the VMM control channel.
+pub const PUBLISHED_SOCKET_HOST_DIR: &str = "published-sockets";
+
+/// Return the protected directory used for default published host listeners.
+pub fn published_socket_host_dir(machine_data_dir: &std::path::Path) -> std::path::PathBuf {
+    machine_data_dir.join(PUBLISHED_SOCKET_HOST_DIR)
+}
+
 /// Resolve the host endpoint used by a published-socket bridge.
 ///
 /// Explicit paths are used verbatim. An exposed guest socket with no explicit
@@ -48,7 +60,7 @@ pub fn effective_published_socket_host_path(
             let basename = std::path::Path::new(&socket.guest_path)
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("published.sock"));
-            machine_data_dir.join(basename)
+            published_socket_host_dir(machine_data_dir).join(basename)
         },
         std::path::PathBuf::from,
     )
@@ -118,11 +130,34 @@ pub fn validate_published_sockets(
                     format!("host path '{host_path}' must be absolute"),
                 ));
             }
+            if std::path::Path::new(host_path)
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err(crate::Error::config(
+                    "publish-socket",
+                    format!("host path '{host_path}' must not contain '..' components"),
+                ));
+            }
         }
 
         match socket.direction {
             SocketDirection::Expose => {
                 let endpoint = effective_published_socket_host_path(socket, machine_data_dir);
+                let published_dir = published_socket_host_dir(machine_data_dir);
+                if !machine_data_dir.as_os_str().is_empty()
+                    && endpoint.starts_with(machine_data_dir)
+                    && !endpoint.starts_with(&published_dir)
+                {
+                    return Err(crate::Error::config(
+                        "expose-socket",
+                        format!(
+                            "host listener '{}' collides with smolvm's protected per-machine runtime namespace; use a path under '{}' or outside the machine data directory",
+                            endpoint.display(),
+                            published_dir.display()
+                        ),
+                    ));
+                }
                 if !host_listeners.insert(endpoint.clone()) {
                     return Err(crate::Error::config(
                         "expose-socket",
@@ -1700,7 +1735,7 @@ mod tests {
         };
         assert_eq!(
             effective_published_socket_host_path(&exposed, machine_dir),
-            machine_dir.join("api.sock")
+            machine_dir.join("published-sockets/api.sock")
         );
         assert!(validate_published_sockets(&[exposed.clone()], machine_dir).is_ok());
 
@@ -1723,6 +1758,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must be absolute"));
+    }
+
+    #[test]
+    fn default_agent_socket_basename_stays_out_of_runtime_namespace() {
+        let machine_dir = std::path::Path::new("/var/lib/smolvm/vms/abc");
+        let exposed = PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path: "/run/agent-workspaces/agent.sock".into(),
+            host_path: None,
+        };
+        assert_eq!(
+            effective_published_socket_host_path(&exposed, machine_dir),
+            machine_dir.join("published-sockets/agent.sock")
+        );
+        assert_ne!(
+            effective_published_socket_host_path(&exposed, machine_dir),
+            machine_dir.join("agent.sock")
+        );
+        assert!(validate_published_sockets(&[exposed], machine_dir).is_ok());
+
+        let explicit_collision = PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path: "/run/app.sock".into(),
+            host_path: Some(
+                machine_dir
+                    .join("agent.sock")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        assert!(
+            validate_published_sockets(&[explicit_collision], machine_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("protected per-machine runtime namespace")
+        );
     }
 
     #[test]

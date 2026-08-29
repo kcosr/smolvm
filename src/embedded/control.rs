@@ -160,6 +160,7 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
         features
             .allow_image_pull_egress(record.image.as_deref(), record.source_smolmachine.is_some());
     }
+    features.published_sockets = record.published_sockets.clone();
     features
 }
 
@@ -174,6 +175,10 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
             .as_deref()
             .and_then(crate::data::image_source::packed_layers_dir_for_ref);
     }
+    crate::config::validate_published_sockets(
+        &features.published_sockets,
+        &crate::agent::vm_data_dir(&record.name),
+    )?;
     Ok(features)
 }
 
@@ -832,12 +837,18 @@ mod tests {
         spec.image = Some("ghcr.io/acme/service:latest".into());
         spec.allowed_hosts = vec!["api.example.com".into()];
         let mut record = spec.to_record();
+        record.published_sockets = vec![crate::config::PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/api.sock".into(),
+            host_path: None,
+        }];
 
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
             features.dns_filter_hosts,
             Some(vec!["api.example.com".into(), "ghcr.io".into()])
         );
+        assert_eq!(features.published_sockets, record.published_sockets);
 
         record.init_completed = true;
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
@@ -852,6 +863,7 @@ mod tests {
             features.dns_filter_hosts,
             Some(vec!["override.example.com".into()])
         );
+        assert_eq!(features.published_sockets, record.published_sockets);
     }
 
     #[test]

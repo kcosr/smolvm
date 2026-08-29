@@ -236,6 +236,22 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+fn prepare_published_socket_host_dir(
+    runtime_dir: Option<&Path>,
+    sockets: &[crate::config::PublishedSocketConfig],
+) -> std::io::Result<()> {
+    if let Some(runtime_dir) = runtime_dir.filter(|_| !sockets.is_empty()) {
+        let published_dir = crate::config::published_socket_host_dir(runtime_dir);
+        std::fs::create_dir_all(&published_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&published_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
 ///
 /// Some teardown paths terminate a VMM directly because its guest agent is
@@ -2087,6 +2103,15 @@ impl AgentManager {
                 let _ = std::fs::create_dir_all(mountpoint);
             }
         }
+        // Defaulted user-published listeners live below a dedicated protected
+        // subdirectory. Create it while the manager still owns the setup phase
+        // and before `chown_tree`, so a privileged serve process hands the
+        // directory to the per-VM uid that libkrun drops to. Creating it later
+        // in the VMM child would fail under the 0700 VM directory or Landlock.
+        prepare_published_socket_host_dir(self.vsock_socket.parent(), &features.published_sockets)
+            .map_err(|error| {
+                Error::agent("create published socket host directory", error.to_string())
+            })?;
         // Whether the per-VM uid drop is active for this boot. The idmapped pack
         // bind mount needs CAP_SYS_ADMIN (root) — the same precondition as the
         // drop — so we only keep `pack_idmap_source` when the drop is active;
@@ -3180,6 +3205,27 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_socket_host_dir_is_prepared_before_uid_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = crate::config::PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/agent-workspaces/agent.sock".into(),
+            host_path: None,
+        };
+        prepare_published_socket_host_dir(Some(temp.path()), &[socket]).unwrap();
+        let published_dir = temp.path().join("published-sockets");
+        assert!(published_dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                published_dir.metadata().unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
 
     #[test]
     fn restored_cuda_clones_fail_faster_than_other_boots() {
