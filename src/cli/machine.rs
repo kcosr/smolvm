@@ -2312,25 +2312,32 @@ mod tests {
 
     #[test]
     fn create_no_net_conflicts_with_network_enabling_flags() {
-        for flag in [
-            "--net",
-            "--net-backend",
-            "--dns",
-            "--network",
-            "--allow-cidr",
-            "--allow-host",
-            "--outbound-localhost-only",
+        for (flag, value) in [
+            ("--net", None),
+            ("--net-backend", Some("tsi")),
+            ("--dns", Some("192.0.2.53")),
+            ("--network", Some("devnet")),
+            ("--allow-cidr", Some("192.0.2.0/24")),
+            ("--allow-host", Some("example.test")),
+            ("--outbound-localhost-only", None),
         ] {
-            let mut args = vec!["machine", "create", "--no-net", flag];
-            match flag {
-                "--net-backend" => args.push("tsi"),
-                "--dns" => args.push("192.0.2.53"),
-                "--network" => args.push("devnet"),
-                "--allow-cidr" => args.push("192.0.2.0/24"),
-                "--allow-host" => args.push("example.test"),
-                _ => {}
+            let mut positive_args = vec!["machine", "create", flag];
+            if let Some(value) = value {
+                positive_args.push(value);
             }
-            assert!(TestMachineCli::try_parse_from(args).is_err(), "{flag}");
+            TestMachineCli::try_parse_from(&positive_args)
+                .unwrap_or_else(|error| panic!("{flag} should parse without --no-net: {error}"));
+
+            let mut args = vec!["machine", "create", "--no-net", flag];
+            if let Some(value) = value {
+                args.push(value);
+            }
+            let error = TestMachineCli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}"
+            );
         }
     }
 
@@ -3172,11 +3179,15 @@ pub struct CreateCmd {
           value_parser = crate::cli::parsers::parse_size_bytes)]
     pub max_image_size: Option<u64>,
 
-    /// Number of virtual CPUs
+    /// Number of virtual CPUs. Inherits the artifact or Smolfile value when
+    /// omitted, or defaults to 4 if neither provides one. An explicit value
+    /// always overrides inherited configuration.
     #[arg(long, value_name = "N")]
     pub cpus: Option<u8>,
 
-    /// Memory allocation in MiB
+    /// Memory allocation in MiB. Inherits the artifact or Smolfile value when
+    /// omitted, or defaults to 8192 if neither provides one. An explicit value
+    /// always overrides inherited configuration.
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
 
