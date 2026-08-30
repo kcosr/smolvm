@@ -863,7 +863,49 @@ pub type OverlayDisk = VmDisk<Overlay>;
 
 /// Expand a disk image at an arbitrary path for a specific disk type.
 pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
+    validate_expand_disk_path(path)?;
     disk_utils::expand_sparse_disk::<D>(path, new_size_gb)
+}
+
+/// Reject disk formats that the raw sparse-file expansion cannot resize.
+///
+/// Qcow2 virtual size is stored in the image metadata. Extending the host file
+/// does not grow the guest disk, so refuse before modifying the image.
+pub fn validate_expand_disk_path(path: &Path) -> Result<()> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("qcow2") {
+        return Err(Error::storage(
+            "expand disk",
+            format!(
+                "qcow2 disk resize is not supported; refusing to modify {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Expand the requested machine disks after validating every target.
+///
+/// The format preflight runs for the complete request before either disk is
+/// changed, so a mixed raw/qcow2 request cannot partially expand the raw disk.
+pub fn expand_requested_disks(
+    storage: Option<(&Path, u64)>,
+    overlay: Option<(&Path, u64)>,
+) -> Result<()> {
+    for path in [storage.map(|(path, _)| path), overlay.map(|(path, _)| path)]
+        .into_iter()
+        .flatten()
+    {
+        validate_expand_disk_path(path)?;
+    }
+
+    if let Some((path, size_gb)) = storage {
+        expand_disk::<Storage>(path, size_gb)?;
+    }
+    if let Some((path, size_gb)) = overlay {
+        expand_disk::<Overlay>(path, size_gb)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1403,6 +1445,57 @@ mod tests {
 
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn expand_disk_rejects_qcow2_without_modifying_it() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let disk_path = temp_dir.path().join("storage.qcow2");
+        let original = b"QFI\xfbunchanged-qcow2-data";
+        std::fs::write(&disk_path, original).unwrap();
+
+        let error = expand_disk::<Storage>(&disk_path, 2).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("qcow2 disk resize is not supported"));
+        assert_eq!(
+            std::fs::metadata(&disk_path).unwrap().len(),
+            original.len() as u64
+        );
+        let mut actual = vec![0; original.len()];
+        use std::io::Read as _;
+        std::fs::File::open(&disk_path)
+            .unwrap()
+            .read_exact(&mut actual)
+            .unwrap();
+        assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn requested_disk_preflight_rejects_qcow2_before_expanding_raw_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_path = temp_dir.path().join("storage.raw");
+        let overlay_path = temp_dir.path().join("overlay.qcow2");
+        let storage_original = b"unchanged-raw-storage";
+        let overlay_original = b"QFI\xfbunchanged-qcow2-overlay";
+        let mut storage_file = std::fs::File::create(&storage_path).unwrap();
+        use std::io::Write as _;
+        storage_file.write_all(storage_original).unwrap();
+        storage_file.set_len(BYTES_PER_GIB).unwrap();
+        std::fs::write(&overlay_path, overlay_original).unwrap();
+
+        let error =
+            expand_requested_disks(Some((&storage_path, 2)), Some((&overlay_path, 1))).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("qcow2 disk resize is not supported"));
+        assert_eq!(
+            std::fs::metadata(&storage_path).unwrap().len(),
+            BYTES_PER_GIB
+        );
+        assert_eq!(std::fs::read(&overlay_path).unwrap(), overlay_original);
     }
 
     #[test]

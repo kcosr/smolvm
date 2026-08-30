@@ -48,13 +48,12 @@ use crate::api::types::{
     StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
-use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
     is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
     VM_SIGTERM_TIMEOUT,
 };
-use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use crate::storage::{expand_requested_disks, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
 use crate::Error as SmolvmError;
 
@@ -2867,21 +2866,16 @@ pub async fn resize_machine(
     let manager = AgentManager::for_vm(&name)
         .map_err(|e| ApiError::internal(format!("failed to get agent manager: {}", e)))?;
 
-    if let Some(storage_gb) = req.storage_gb {
-        if storage_gb > current_storage_gb {
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| ApiError::internal(format!("failed to expand storage: {}", e)))?;
-        }
-    }
-
-    if let Some(overlay_gb) = req.overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| ApiError::internal(format!("failed to expand overlay: {}", e)))?;
-        }
-    }
+    let storage_expansion = req
+        .storage_gb
+        .filter(|size| *size > current_storage_gb)
+        .map(|size| (manager.storage_path(), size));
+    let overlay_expansion = req
+        .overlay_gb
+        .filter(|size| *size > current_overlay_gb)
+        .map(|size| (manager.overlay_path(), size));
+    expand_requested_disks(storage_expansion, overlay_expansion)
+        .map_err(|e| ApiError::internal(format!("failed to expand machine disks: {}", e)))?;
 
     let (storage_gb, overlay_gb) = (req.storage_gb, req.overlay_gb);
     let record = state
