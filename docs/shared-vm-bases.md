@@ -16,7 +16,8 @@ sudo smolvm machine install-base \
 The source artifact must itself be a root-owned, non-writable regular file.
 Every ancestor directory leading to the installed base root must also be
 trusted, root-owned, and not writable by group or other users (a root-owned
-sticky directory such as `/tmp` is permitted). The installer snapshots the
+sticky directory such as `/tmp` is permitted); existing ancestors must grant
+consumers directory traversal. The installer snapshots the
 artifact through one open file descriptor,
 hashes and extracts that snapshot in private staging, publishes root-owned
 read-only `base.raw` files and a complete release marker below the artifact

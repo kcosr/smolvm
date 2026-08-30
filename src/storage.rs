@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -841,34 +841,92 @@ fn prepare_operator_base_root_owned(base_root: &Path, required_owner: u32) -> st
         ));
     }
     validate_operator_base_ancestors(base_root, required_owner)?;
-    match std::fs::symlink_metadata(base_root) {
-        Ok(_) => {
-            // Reject an existing symlink or untrusted directory before chmod
-            // could follow it and mutate a different target.
-            validate_operator_base_node(base_root, true, required_owner)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "inspect shared VM base directory {}: {error}",
-                    base_root.display()
-                ),
-            ));
+
+    // Find the nearest existing ancestor without following a symlink. The
+    // complete existing chain was validated above; retaining the missing
+    // components lets us publish them one at a time with a private create mode.
+    let mut missing = Vec::new();
+    let mut cursor = base_root;
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                if cursor == base_root {
+                    // Reject an existing symlink or unsafe root before chmod
+                    // could follow it and mutate a different target.
+                    validate_operator_base_node(cursor, true, required_owner)?;
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "shared VM base directory has no existing ancestor: {}",
+                            base_root.display()
+                        ),
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "inspect shared VM base directory {}: {error}",
+                        cursor.display()
+                    ),
+                ));
+            }
         }
     }
-    std::fs::create_dir_all(base_root).map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "create shared VM base directory {}: {error}",
-                base_root.display()
-            ),
-        )
-    })?;
-    validate_operator_base_node(base_root, true, required_owner)?;
-    std::fs::set_permissions(base_root, std::fs::Permissions::from_mode(0o711))?;
+
+    for path in missing.iter().rev() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(path) {
+            Ok(()) => {}
+            // Another trusted installer may have won this component. Validate
+            // it exactly as an existing node before applying publication mode.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "create shared VM base directory component {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        validate_operator_base_node(path, true, required_owner)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o711)).map_err(
+            |error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "publish shared VM base directory component {}: {error}",
+                        path.display()
+                    ),
+                )
+            },
+        )?;
+        validate_operator_base_node(path, true, required_owner)?;
+    }
+
+    if missing.is_empty() {
+        std::fs::set_permissions(base_root, std::fs::Permissions::from_mode(0o711)).map_err(
+            |error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "publish shared VM base directory {}: {error}",
+                        base_root.display()
+                    ),
+                )
+            },
+        )?;
+    }
     validate_operator_base_root(base_root, required_owner)
 }
 
@@ -1665,10 +1723,17 @@ mod tests {
         file.set_len(logical_size).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    fn private_test_tempdir() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        temp
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn vm_base_install_staging_is_private_and_inside_base_root() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let base_root = temp.path().join("installed-bases");
         let owner = unsafe { libc::geteuid() };
         let staging = create_vm_base_install_staging_owned(&base_root, owner).unwrap();
@@ -1691,6 +1756,33 @@ mod tests {
             std::fs::metadata(&base_root).unwrap().permissions().mode() & 0o777,
             0o711
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn operator_base_creation_publishes_each_missing_component_as_0711() {
+        let temp = private_test_tempdir();
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first = existing.join("operator");
+        let base_root = first.join("installed-bases");
+        let owner = unsafe { libc::geteuid() };
+
+        prepare_operator_base_root_owned(&base_root, owner).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the already-trusted ancestor is not republished"
+        );
+        for created in [&first, &base_root] {
+            assert_eq!(
+                std::fs::metadata(created).unwrap().permissions().mode() & 0o777,
+                0o711,
+                "every created component must be traversable independent of umask"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1720,6 +1812,7 @@ mod tests {
     fn prepare_test_installed_release(
         temp: &tempfile::TempDir,
     ) -> (PathBuf, InstalledVmBaseRelease, u32) {
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let extracted = temp.path().join("operator-staging");
         let base_root = temp.path().join("installed-bases");
         std::fs::create_dir_all(&extracted).unwrap();
@@ -1756,7 +1849,7 @@ mod tests {
     fn operator_base_rejects_symlinked_and_untrusted_paths() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let owner = unsafe { libc::geteuid() };
         let real_parent = temp.path().join("real-parent");
         std::fs::create_dir(&real_parent).unwrap();
@@ -1801,7 +1894,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn installed_release_errors_identify_variant_and_marker_path() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let (base_root, release, owner) = prepare_test_installed_release(&temp);
         publish_installed_release(&base_root, &release, owner).unwrap();
 
@@ -1848,7 +1941,7 @@ mod tests {
     fn installed_release_publication_is_idempotent_and_concurrent() {
         use std::sync::{Arc, Barrier};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let (base_root, release, owner) = prepare_test_installed_release(&temp);
         let release = Arc::new(release);
         let barrier = Arc::new(Barrier::new(8));
@@ -1981,7 +2074,7 @@ mod tests {
     fn installed_vm_bases_back_two_private_user_stores_without_extraction() {
         use std::os::unix::fs::MetadataExt as _;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let extracted = temp.path().join("operator-staging");
         let base_root = temp.path().join("installed-bases");
         let first = temp.path().join("user-a");
@@ -2061,7 +2154,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn installed_vm_base_missing_or_writable_fails_without_copy_fallback() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let extracted = temp.path().join("operator-staging");
         let base_root = temp.path().join("installed-bases");
         let machine = temp.path().join("user");
@@ -2124,7 +2217,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn installed_vm_base_validates_every_disk_before_mutating_machine_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_test_tempdir();
         let extracted = temp.path().join("operator-staging");
         let base_root = temp.path().join("installed-bases");
         let machine = temp.path().join("user");
