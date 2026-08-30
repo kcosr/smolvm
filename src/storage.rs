@@ -78,6 +78,50 @@ pub struct VmModeDiskSeedSpec<'a> {
     pub storage_gb: Option<u64>,
 }
 
+/// Manifest-backed disk information used by an operator-installed VM base.
+///
+/// Unlike [`VmModeDiskSeedSpec`], this includes each packed template's declared
+/// byte length so an unprivileged consumer can validate the installed metadata
+/// without extracting the artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct InstalledVmModeDiskSeedSpec<'a> {
+    /// Relative path of the packed root overlay template.
+    pub overlay_template: Option<&'a str>,
+    /// Declared packed byte length of the root overlay template.
+    pub overlay_source_size: Option<u64>,
+    /// Relative path of the packed persistent storage template.
+    pub storage_template: Option<&'a str>,
+    /// Declared packed byte length of the persistent storage template.
+    pub storage_source_size: Option<u64>,
+    /// Logical byte length restored for the root overlay.
+    pub overlay_logical_size: Option<u64>,
+    /// Logical byte length restored for persistent storage.
+    pub storage_logical_size: Option<u64>,
+    /// Requested root overlay size when larger than the artifact default.
+    pub overlay_gb: Option<u64>,
+    /// Requested storage size when larger than the artifact default.
+    pub storage_gb: Option<u64>,
+}
+
+/// Environment variable pointing at operator-installed immutable VM bases.
+pub const SHARED_VM_BASE_DIR_ENV: &str = "SMOLVM_SHARED_VM_BASE_DIR";
+
+/// Resolve the optional operator base root used by direct, per-user CLI calls.
+pub fn shared_vm_base_root_from_env() -> std::io::Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(SHARED_VM_BASE_DIR_ENV).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{SHARED_VM_BASE_DIR_ENV} must be an absolute path"),
+        ));
+    }
+    Ok(Some(path))
+}
+
 /// Seeds one VM-mode machine from the extracted pack disk templates.
 pub fn seed_vm_mode_disks(
     disk_dir: &Path,
@@ -136,13 +180,21 @@ fn seed_vm_mode_disks_by_copy(
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CowBaseMetadata {
     artifact_sha256: String,
     disk_type: String,
     source_template: String,
     source_size: u64,
     logical_size: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct InstalledVmBaseRelease {
+    version: u32,
+    artifact_sha256: String,
+    disks: Vec<CowBaseMetadata>,
 }
 
 #[cfg(target_os = "linux")]
@@ -156,6 +208,342 @@ static COW_BASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 pub(crate) fn cow_base_cache_root() -> PathBuf {
     crate::agent::vm_cache_root().join("_cow-bases")
+}
+
+/// Install immutable VM-mode disk bases from one extracted artifact.
+///
+/// This is an operator action. The caller extracts the artifact into
+/// `extracted_pack`, passes its full SHA-256, and publishes into a root-owned
+/// absolute directory. Ordinary machine lifecycle never writes this store.
+#[cfg(target_os = "linux")]
+pub fn install_vm_mode_disk_bases(
+    base_root: &Path,
+    extracted_pack: &Path,
+    artifact_sha256: &str,
+    seed: InstalledVmModeDiskSeedSpec<'_>,
+) -> std::io::Result<Vec<PathBuf>> {
+    validate_artifact_sha256(artifact_sha256)?;
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "installing shared VM bases requires root",
+        ));
+    }
+    prepare_operator_base_root(base_root)?;
+    let release = expected_installed_release(artifact_sha256, seed)?;
+
+    let mut installed = Vec::with_capacity(2);
+    for definition in installed_disk_definitions(seed) {
+        let Some((template, declared_size)) = definition.template.zip(definition.source_size)
+        else {
+            if definition.template.is_some() != definition.source_size.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} template path and source size must both be present",
+                        definition.disk_type
+                    ),
+                ));
+            }
+            continue;
+        };
+        let source = resolve_template_in_cache(extracted_pack, template)?;
+        let actual_size = std::fs::symlink_metadata(&source)?.len();
+        if !std::fs::symlink_metadata(&source)?.file_type().is_file()
+            || actual_size != declared_size
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} template does not match manifest size: {}",
+                    definition.disk_type,
+                    source.display()
+                ),
+            ));
+        }
+        let logical_size = disk_target_size(
+            declared_size,
+            definition.logical_size,
+            definition.size_gb_override,
+        )?;
+        let base = prepare_cow_base(
+            base_root,
+            artifact_sha256,
+            definition.disk_type,
+            template,
+            &source,
+            declared_size,
+            logical_size,
+        )?;
+        let base_dir = base.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "installed VM base has no parent directory",
+            )
+        })?;
+        let expected = CowBaseMetadata {
+            artifact_sha256: artifact_sha256.to_string(),
+            disk_type: definition.disk_type.to_string(),
+            source_template: template.to_string(),
+            source_size: declared_size,
+            logical_size,
+        };
+        validate_operator_base_path(base_root, base_dir, 0)?;
+        installed.push(validate_cow_base_owned(base_dir, &expected, 0)?);
+    }
+    if installed.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "VM-mode artifact contains no disk templates",
+        ));
+    }
+    publish_installed_release(base_root, &release, 0)?;
+    Ok(installed)
+}
+
+/// Prepare the operator-owned shared base root and create private installation
+/// staging on the same filesystem. Keeping the artifact snapshot and extracted
+/// sparse disks here avoids exhausting a separate system temporary filesystem
+/// and allows the final base publication to use filesystem clones.
+#[cfg(target_os = "linux")]
+pub fn create_vm_base_install_staging(base_root: &Path) -> std::io::Result<tempfile::TempDir> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "preparing shared VM base installation requires root",
+        ));
+    }
+    create_vm_base_install_staging_owned(base_root, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn create_vm_base_install_staging_owned(
+    base_root: &Path,
+    required_owner: u32,
+) -> std::io::Result<tempfile::TempDir> {
+    prepare_operator_base_root_owned(base_root, required_owner)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".smolvm-vm-base-install-")
+        .tempdir_in(base_root)?;
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(staging)
+}
+
+/// Create private qcow2 disks backed by one operator-installed VM base release.
+///
+/// Missing, writable, mismatched, symlinked, or non-root-owned bases fail
+/// closed. There is deliberately no sparse-copy fallback: that would silently
+/// restore per-user duplication and violate the shared-base contract.
+#[cfg(target_os = "linux")]
+pub fn seed_vm_mode_disks_from_installed_bases(
+    disk_dir: &Path,
+    base_root: &Path,
+    artifact_sha256: &str,
+    seed: InstalledVmModeDiskSeedSpec<'_>,
+) -> std::io::Result<()> {
+    seed_vm_mode_disks_from_installed_bases_with(
+        disk_dir,
+        base_root,
+        artifact_sha256,
+        seed,
+        crate::agent::create_disk_overlays,
+        0,
+    )
+}
+
+/// Operator-installed qcow2 backing bases require Linux filesystem ownership
+/// and permission guarantees.
+#[cfg(not(target_os = "linux"))]
+pub fn seed_vm_mode_disks_from_installed_bases(
+    _disk_dir: &Path,
+    _base_root: &Path,
+    _artifact_sha256: &str,
+    _seed: InstalledVmModeDiskSeedSpec<'_>,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "operator-installed VM bases are supported only on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn seed_vm_mode_disks_from_installed_bases_with<F>(
+    disk_dir: &Path,
+    base_root: &Path,
+    artifact_sha256: &str,
+    seed: InstalledVmModeDiskSeedSpec<'_>,
+    create_overlays: F,
+    required_owner: u32,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&[crate::agent::DiskOverlaySpec]) -> crate::Result<()>,
+{
+    validate_artifact_sha256(artifact_sha256)?;
+    validate_operator_base_root(base_root, required_owner)?;
+    let release = expected_installed_release(artifact_sha256, seed)?;
+    validate_installed_release(base_root, &release, required_owner)?;
+
+    let mut overlay_specs = Vec::with_capacity(2);
+    let mut overlay_paths = Vec::with_capacity(2);
+    let sequence = COW_BASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    for definition in installed_disk_definitions(seed) {
+        let Some((template, source_size)) = definition.template.zip(definition.source_size) else {
+            if definition.template.is_some() != definition.source_size.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} template path and source size must both be present",
+                        definition.disk_type
+                    ),
+                ));
+            }
+            continue;
+        };
+        let logical_size = disk_target_size(
+            source_size,
+            definition.logical_size,
+            definition.size_gb_override,
+        )?;
+        let expected = CowBaseMetadata {
+            artifact_sha256: artifact_sha256.to_string(),
+            disk_type: definition.disk_type.to_string(),
+            source_template: template.to_string(),
+            source_size,
+            logical_size,
+        };
+        let base_dir = base_root
+            .join(artifact_sha256)
+            .join(format!("{}-{logical_size}", definition.disk_type));
+        validate_operator_base_path(base_root, &base_dir, required_owner)?;
+        let base = validate_cow_base_owned(&base_dir, &expected, required_owner)?;
+        let destination = disk_dir.join(definition.destination);
+        let final_overlay = destination.with_extension("qcow2");
+        let staging_overlay = disk_dir.join(format!(
+            ".{}.installing-{}-{sequence}",
+            final_overlay
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("disk.qcow2"),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&staging_overlay);
+        overlay_specs.push((staging_overlay.clone(), base, DiskFormat::Raw));
+        overlay_paths.push((staging_overlay, final_overlay, destination));
+    }
+    if overlay_specs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "VM-mode artifact contains no installed disk templates",
+        ));
+    }
+    if let Err(error) = create_overlays(&overlay_specs) {
+        for (staging, _, _) in &overlay_paths {
+            let _ = std::fs::remove_file(staging);
+        }
+        return Err(std::io::Error::other(format!(
+            "create private overlays from installed VM bases: {error}"
+        )));
+    }
+    for (staging, final_overlay, destination) in overlay_paths {
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(destination.with_extension("formatted"));
+        let _ = std::fs::remove_file(&final_overlay);
+        std::fs::rename(staging, final_overlay)?;
+        std::fs::write(destination.with_extension("formatted"), b"1")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct InstalledDiskDefinition<'a> {
+    disk_type: &'static str,
+    destination: &'static str,
+    template: Option<&'a str>,
+    source_size: Option<u64>,
+    logical_size: Option<u64>,
+    size_gb_override: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn installed_disk_definitions(
+    seed: InstalledVmModeDiskSeedSpec<'_>,
+) -> [InstalledDiskDefinition<'_>; 2] {
+    [
+        InstalledDiskDefinition {
+            disk_type: "overlay",
+            destination: OVERLAY_DISK_FILENAME,
+            template: seed.overlay_template,
+            source_size: seed.overlay_source_size,
+            logical_size: seed.overlay_logical_size,
+            size_gb_override: seed.overlay_gb,
+        },
+        InstalledDiskDefinition {
+            disk_type: "storage",
+            destination: STORAGE_DISK_FILENAME,
+            template: seed.storage_template,
+            source_size: seed.storage_source_size,
+            logical_size: seed.storage_logical_size,
+            size_gb_override: seed.storage_gb,
+        },
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn expected_installed_release(
+    artifact_sha256: &str,
+    seed: InstalledVmModeDiskSeedSpec<'_>,
+) -> std::io::Result<InstalledVmBaseRelease> {
+    let mut disks = Vec::with_capacity(2);
+    for definition in installed_disk_definitions(seed) {
+        let Some((template, source_size)) = definition.template.zip(definition.source_size) else {
+            if definition.template.is_some() != definition.source_size.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} template path and source size must both be present",
+                        definition.disk_type
+                    ),
+                ));
+            }
+            continue;
+        };
+        disks.push(CowBaseMetadata {
+            artifact_sha256: artifact_sha256.to_string(),
+            disk_type: definition.disk_type.to_string(),
+            source_template: template.to_string(),
+            source_size,
+            logical_size: disk_target_size(
+                source_size,
+                definition.logical_size,
+                definition.size_gb_override,
+            )?,
+        });
+    }
+    if disks.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "VM-mode artifact contains no disk templates",
+        ));
+    }
+    Ok(InstalledVmBaseRelease {
+        version: 1,
+        artifact_sha256: artifact_sha256.to_string(),
+        disks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn installed_release_path(base_root: &Path, release: &InstalledVmBaseRelease) -> PathBuf {
+    let variants = release
+        .disks
+        .iter()
+        .map(|disk| format!("{}-{}", disk.disk_type, disk.logical_size))
+        .collect::<Vec<_>>()
+        .join("-");
+    base_root
+        .join(&release.artifact_sha256)
+        .join(format!("release-{variants}.json"))
 }
 
 /// Build all immutable bases first, then create both private overlays in one
@@ -397,6 +785,221 @@ fn validate_cow_base(base_dir: &Path, expected: &CowBaseMetadata) -> std::io::Re
         ));
     }
     base.canonicalize()
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_operator_base_root(base_root: &Path) -> std::io::Result<()> {
+    prepare_operator_base_root_owned(base_root, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_operator_base_root_owned(base_root: &Path, required_owner: u32) -> std::io::Result<()> {
+    if !base_root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shared VM base directory must be absolute",
+        ));
+    }
+    std::fs::create_dir_all(base_root)?;
+    std::fs::set_permissions(base_root, std::fs::Permissions::from_mode(0o711))?;
+    validate_operator_base_root(base_root, required_owner)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_installed_release(
+    base_root: &Path,
+    release: &InstalledVmBaseRelease,
+    required_owner: u32,
+) -> std::io::Result<()> {
+    let path = installed_release_path(base_root, release);
+    if path.exists() {
+        return validate_installed_release(base_root, release, required_owner);
+    }
+    let digest_dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "installed VM release marker has no parent",
+        )
+    })?;
+    let sequence = COW_BASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging = digest_dir.join(format!(".release.tmp-{}-{sequence}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(release)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staging)?;
+        use std::io::Write as _;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o444))?;
+        match std::fs::hard_link(&staging, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::remove_file(&staging)?;
+        validate_installed_release(base_root, release, required_owner)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn validate_installed_release(
+    base_root: &Path,
+    expected: &InstalledVmBaseRelease,
+    required_owner: u32,
+) -> std::io::Result<()> {
+    let path = installed_release_path(base_root, expected);
+    let digest_dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "installed VM release marker has no parent",
+        )
+    })?;
+    let digest_metadata = validate_operator_base_node(digest_dir, true, required_owner)?;
+    if !digest_metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid VM base digest directory: {}", digest_dir.display()),
+        ));
+    }
+    validate_operator_base_node(&path, false, required_owner)?;
+    let actual: InstalledVmBaseRelease =
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("corrupt VM base release marker {}: {error}", path.display()),
+            )
+        })?;
+    if &actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("VM base release marker mismatch: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_operator_base_root(base_root: &Path, required_owner: u32) -> std::io::Result<()> {
+    if !base_root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shared VM base directory must be absolute",
+        ));
+    }
+    let metadata = validate_operator_base_node(base_root, true, required_owner)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "shared VM base root is not a directory: {}",
+                base_root.display()
+            ),
+        ));
+    }
+    if base_root.canonicalize()? != base_root {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "shared VM base root must be canonical and may not be a symlink: {}",
+                base_root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_operator_base_path(
+    base_root: &Path,
+    base_dir: &Path,
+    required_owner: u32,
+) -> std::io::Result<()> {
+    let digest_dir = base_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "base directory has no parent",
+        )
+    })?;
+    for path in [digest_dir, base_dir] {
+        let metadata = validate_operator_base_node(path, true, required_owner)?;
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("shared VM base path is not a directory: {}", path.display()),
+            ));
+        }
+    }
+    let canonical = base_dir.canonicalize()?;
+    if !canonical.starts_with(base_root) || canonical != base_dir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("shared VM base escapes its root: {}", base_dir.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_operator_base_node(
+    path: &Path,
+    directory: bool,
+    required_owner: u32,
+) -> std::io::Result<std::fs::Metadata> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    let expected_type = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !expected_type || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe shared VM base node type: {}", path.display()),
+        ));
+    }
+    if metadata.uid() != required_owner {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "shared VM base node has uid {}, expected {required_owner}: {}",
+                metadata.uid(),
+                path.display()
+            ),
+        ));
+    }
+    let forbidden_write_bits = if directory { 0o022 } else { 0o222 };
+    if metadata.permissions().mode() & forbidden_write_bits != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "shared VM base node has unsafe write permissions: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cow_base_owned(
+    base_dir: &Path,
+    expected: &CowBaseMetadata,
+    required_owner: u32,
+) -> std::io::Result<PathBuf> {
+    let metadata_path = base_dir.join("metadata.json");
+    let base = base_dir.join("base.raw");
+    validate_operator_base_node(&metadata_path, false, required_owner)?;
+    validate_operator_base_node(&base, false, required_owner)?;
+    validate_cow_base(base_dir, expected)
 }
 
 /// Sparse-copy one packed template into `dest`, grow it to the largest of its copied
@@ -883,6 +1486,34 @@ mod tests {
         file.set_len(logical_size).unwrap();
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_base_install_staging_is_private_and_inside_base_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_root = temp.path().join("installed-bases");
+        let owner = unsafe { libc::geteuid() };
+        let staging = create_vm_base_install_staging_owned(&base_root, owner).unwrap();
+
+        assert_eq!(staging.path().parent(), Some(base_root.as_path()));
+        assert!(staging
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".smolvm-vm-base-install-")));
+        assert_eq!(
+            std::fs::metadata(staging.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&base_root).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn make_fake_overlays(specs: &[crate::agent::DiskOverlaySpec]) -> crate::Result<()> {
         for (overlay, _, _) in specs {
@@ -994,6 +1625,226 @@ mod tests {
         );
         make_tree_removable(&cache);
         make_tree_removable(&base_cache);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_vm_bases_back_two_private_user_stores_without_extraction() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let extracted = temp.path().join("operator-staging");
+        let base_root = temp.path().join("installed-bases");
+        let first = temp.path().join("user-a");
+        let second = temp.path().join("user-b");
+        for path in [&extracted, &base_root, &first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::set_permissions(&base_root, std::fs::Permissions::from_mode(0o711)).unwrap();
+        write_sparse_template(&extracted.join("overlay.raw"), 1024 * 1024, b"root");
+        write_sparse_template(&extracted.join("storage.raw"), 512 * 1024, b"storage");
+        let seed = InstalledVmModeDiskSeedSpec {
+            overlay_template: Some("overlay.raw"),
+            overlay_source_size: Some(1024 * 1024),
+            storage_template: Some("storage.raw"),
+            storage_source_size: Some(512 * 1024),
+            overlay_logical_size: Some(4 * 1024 * 1024),
+            storage_logical_size: Some(3 * 1024 * 1024),
+            overlay_gb: None,
+            storage_gb: None,
+        };
+        let expected_overlay = prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &extracted.join("overlay.raw"),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let expected_storage = prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "storage",
+            "storage.raw",
+            &extracted.join("storage.raw"),
+            512 * 1024,
+            3 * 1024 * 1024,
+        )
+        .unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let release = expected_installed_release(TEST_ARTIFACT_SHA256, seed).unwrap();
+        publish_installed_release(&base_root, &release, owner).unwrap();
+
+        for machine in [&first, &second] {
+            seed_vm_mode_disks_from_installed_bases_with(
+                machine,
+                &base_root,
+                TEST_ARTIFACT_SHA256,
+                seed,
+                |specs| {
+                    assert_eq!(specs.len(), 2);
+                    assert_eq!(specs[0].1, expected_overlay);
+                    assert_eq!(specs[1].1, expected_storage);
+                    make_fake_overlays(specs)
+                },
+                owner,
+            )
+            .unwrap();
+        }
+        assert_ne!(
+            std::fs::metadata(first.join("overlay.qcow2"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(second.join("overlay.qcow2"))
+                .unwrap()
+                .ino()
+        );
+        assert!(!first.join("pack").exists());
+        assert!(!second.join("pack").exists());
+        std::fs::remove_dir_all(&first).unwrap();
+        assert!(expected_overlay.exists());
+        assert!(expected_storage.exists());
+        make_tree_removable(&base_root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_vm_base_missing_or_writable_fails_without_copy_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let extracted = temp.path().join("operator-staging");
+        let base_root = temp.path().join("installed-bases");
+        let machine = temp.path().join("user");
+        for path in [&extracted, &base_root, &machine] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::set_permissions(&base_root, std::fs::Permissions::from_mode(0o711)).unwrap();
+        write_sparse_template(&extracted.join("overlay.raw"), 1024 * 1024, b"root");
+        let seed = InstalledVmModeDiskSeedSpec {
+            overlay_template: Some("overlay.raw"),
+            overlay_source_size: Some(1024 * 1024),
+            storage_template: None,
+            storage_source_size: None,
+            overlay_logical_size: Some(2 * 1024 * 1024),
+            storage_logical_size: None,
+            overlay_gb: None,
+            storage_gb: None,
+        };
+        let owner = unsafe { libc::geteuid() };
+        let missing = seed_vm_mode_disks_from_installed_bases_with(
+            &machine,
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            seed,
+            make_fake_overlays,
+            owner,
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(!machine.join("overlay.qcow2").exists());
+        assert!(!machine.join(OVERLAY_DISK_FILENAME).exists());
+
+        let base = prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &extracted.join("overlay.raw"),
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        let release = expected_installed_release(TEST_ARTIFACT_SHA256, seed).unwrap();
+        publish_installed_release(&base_root, &release, owner).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let writable = seed_vm_mode_disks_from_installed_bases_with(
+            &machine,
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            seed,
+            make_fake_overlays,
+            owner,
+        )
+        .unwrap_err();
+        assert_eq!(writable.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!machine.join("overlay.qcow2").exists());
+        make_tree_removable(&base_root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_vm_base_validates_every_disk_before_mutating_machine_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let extracted = temp.path().join("operator-staging");
+        let base_root = temp.path().join("installed-bases");
+        let machine = temp.path().join("user");
+        for path in [&extracted, &base_root, &machine] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::set_permissions(&base_root, std::fs::Permissions::from_mode(0o711)).unwrap();
+        write_sparse_template(&extracted.join("overlay.raw"), 1024 * 1024, b"root");
+        write_sparse_template(&extracted.join("storage.raw"), 512 * 1024, b"storage");
+        let seed = InstalledVmModeDiskSeedSpec {
+            overlay_template: Some("overlay.raw"),
+            overlay_source_size: Some(1024 * 1024),
+            storage_template: Some("storage.raw"),
+            storage_source_size: Some(512 * 1024),
+            overlay_logical_size: Some(2 * 1024 * 1024),
+            storage_logical_size: Some(3 * 1024 * 1024),
+            overlay_gb: None,
+            storage_gb: None,
+        };
+        prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &extracted.join("overlay.raw"),
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        let storage = prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "storage",
+            "storage.raw",
+            &extracted.join("storage.raw"),
+            512 * 1024,
+            3 * 1024 * 1024,
+        )
+        .unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let release = expected_installed_release(TEST_ARTIFACT_SHA256, seed).unwrap();
+        publish_installed_release(&base_root, &release, owner).unwrap();
+
+        let storage_dir = storage.parent().unwrap();
+        std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&storage).unwrap();
+        std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(machine.join("overlay.qcow2"), b"original-overlay").unwrap();
+        std::fs::write(machine.join("storage.qcow2"), b"original-storage").unwrap();
+
+        let error = seed_vm_mode_disks_from_installed_bases_with(
+            &machine,
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            seed,
+            make_fake_overlays,
+            owner,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read(machine.join("overlay.qcow2")).unwrap(),
+            b"original-overlay"
+        );
+        assert_eq!(
+            std::fs::read(machine.join("storage.qcow2")).unwrap(),
+            b"original-storage"
+        );
+        make_tree_removable(&base_root);
     }
 
     #[test]

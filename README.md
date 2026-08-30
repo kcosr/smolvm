@@ -73,6 +73,10 @@ smolvm machine create --name myvm -s Smolfile   # or --smolfile <PATH>
 smolvm machine start --name myvm
 ```
 
+On multi-user Linux hosts, an operator can install the immutable disks from a
+full-disk VM artifact once while every user retains private qcow2 overlays and
+SmolVM state. See [Shared full-disk VM bases](docs/shared-vm-bases.md).
+
 Port mappings accept a single port (`"8080"`), an explicit mapping (`"8080:80"`), or equal-length one-to-one ranges (`"5173-5180:5173-5180"`). A machine can publish at most 64 concrete mappings.
 
 Unknown keys are rejected rather than ignored, so a typo fails at create time

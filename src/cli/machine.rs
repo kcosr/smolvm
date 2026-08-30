@@ -328,6 +328,9 @@ pub enum MachineCmd {
     /// Create a new named machine configuration
     Create(CreateCmd),
 
+    /// Install a VM-mode artifact's immutable disk bases for shared use
+    InstallBase(InstallBaseCmd),
+
     /// Start a machine
     Start(StartCmd),
 
@@ -403,7 +406,7 @@ impl MachineCmd {
         // over successive runs. Other commands sweep everything.
         if matches!(self, MachineCmd::Run(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
-        } else {
+        } else if !matches!(self, MachineCmd::InstallBase(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
@@ -411,6 +414,7 @@ impl MachineCmd {
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
+            MachineCmd::InstallBase(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
@@ -430,6 +434,179 @@ impl MachineCmd {
             MachineCmd::NetworkTest(cmd) => cmd.run(),
             MachineCmd::DataDir(cmd) => cmd.run(),
         }
+    }
+}
+
+/// Operator installation of immutable full-disk bases.
+#[derive(Args, Debug)]
+pub struct InstallBaseCmd {
+    /// VM-mode `.smolmachine` artifact to install
+    #[arg(long = "from", value_name = "PATH")]
+    pub source: PathBuf,
+
+    /// Root-owned destination (defaults to SMOLVM_SHARED_VM_BASE_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub base_dir: Option<PathBuf>,
+
+    /// Installed root overlay size in GiB (defaults to artifact size)
+    #[arg(long, value_name = "GIB")]
+    pub overlay: Option<u64>,
+
+    /// Installed persistent storage size in GiB (defaults to artifact size)
+    #[arg(long, value_name = "GIB")]
+    pub storage: Option<u64>,
+}
+
+impl InstallBaseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
+            return Err(smolvm::Error::config(
+                "install shared VM base",
+                "operator-installed shared VM bases are supported only on Linux",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(smolvm::Error::config(
+                    "install shared VM base",
+                    "this operator action must run as root",
+                ));
+            }
+            let base_dir = match self.base_dir {
+                Some(path) => path,
+                None => smolvm::storage::shared_vm_base_root_from_env()
+                    .map_err(|error| {
+                        smolvm::Error::config("resolve shared VM base directory", error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        smolvm::Error::config(
+                            "install shared VM base",
+                            format!(
+                                "pass --base-dir or set {}",
+                                smolvm::storage::SHARED_VM_BASE_DIR_ENV
+                            ),
+                        )
+                    })?,
+            };
+            let staging =
+                smolvm::storage::create_vm_base_install_staging(&base_dir).map_err(|error| {
+                    smolvm::Error::agent("create VM base staging directory", error.to_string())
+                })?;
+            let snapshot = snapshot_operator_artifact(&self.source, staging.path())?;
+            let manifest =
+                smolvm_pack::packer::read_manifest_from_sidecar(&snapshot).map_err(|error| {
+                    smolvm::Error::agent("read VM base manifest", error.to_string())
+                })?;
+            if manifest.mode != smolvm_pack::PackMode::Vm {
+                return Err(smolvm::Error::config(
+                    "install shared VM base",
+                    "only full-disk VM-mode artifacts can be installed",
+                ));
+            }
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(&snapshot)
+                .map_err(|error| smolvm::Error::agent("read VM base footer", error.to_string()))?;
+            let artifact_sha256 =
+                smolvm_pack::extract::hash_artifact_sha256(&snapshot).map_err(|error| {
+                    smolvm::Error::agent("hash VM base artifact", error.to_string())
+                })?;
+            let extracted = staging.path().join("extracted");
+            smolvm_pack::extract::extract_sidecar_uncapped(
+                &snapshot, &extracted, &footer, false, false,
+            )
+            .map_err(|error| smolvm::Error::agent("extract VM base artifact", error.to_string()))?;
+            let seed = installed_vm_seed(&manifest, self.overlay, self.storage);
+            let installed = smolvm::storage::install_vm_mode_disk_bases(
+                &base_dir,
+                &extracted,
+                &artifact_sha256,
+                seed,
+            )
+            .map_err(|error| smolvm::Error::agent("install VM disk bases", error.to_string()))?;
+            println!("Installed VM base artifact: {artifact_sha256}");
+            for path in installed {
+                println!("  {}", path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_operator_artifact(source: &Path, staging: &Path) -> smolvm::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut input = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| {
+            smolvm::Error::agent("open immutable VM base artifact", error.to_string())
+        })?;
+    let metadata = input.metadata().map_err(|error| {
+        smolvm::Error::agent("inspect immutable VM base artifact", error.to_string())
+    })?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.permissions().mode() & 0o222 != 0 {
+        return Err(smolvm::Error::config(
+            "install shared VM base",
+            "source artifact must be a root-owned, non-writable regular file",
+        ));
+    }
+
+    let snapshot = staging.join("artifact.smolmachine");
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&snapshot)
+        .map_err(|error| smolvm::Error::agent("create artifact snapshot", error.to_string()))?;
+    let copied = std::io::copy(&mut input, &mut output)
+        .map_err(|error| smolvm::Error::agent("snapshot VM base artifact", error.to_string()))?;
+    if copied != metadata.len() {
+        return Err(smolvm::Error::agent(
+            "snapshot VM base artifact",
+            format!("copied {copied} bytes, expected {}", metadata.len()),
+        ));
+    }
+    output
+        .sync_all()
+        .map_err(|error| smolvm::Error::agent("sync VM base snapshot", error.to_string()))?;
+    Ok(snapshot)
+}
+
+fn installed_vm_seed<'a>(
+    manifest: &'a smolvm_pack::PackManifest,
+    overlay_gb: Option<u64>,
+    storage_gb: Option<u64>,
+) -> smolvm::storage::InstalledVmModeDiskSeedSpec<'a> {
+    smolvm::storage::InstalledVmModeDiskSeedSpec {
+        overlay_template: manifest
+            .assets
+            .overlay_template
+            .as_ref()
+            .map(|entry| entry.path.as_str()),
+        overlay_source_size: manifest
+            .assets
+            .overlay_template
+            .as_ref()
+            .map(|entry| entry.size),
+        storage_template: manifest
+            .assets
+            .storage_template
+            .as_ref()
+            .map(|entry| entry.path.as_str()),
+        storage_source_size: manifest
+            .assets
+            .storage_template
+            .as_ref()
+            .map(|entry| entry.size),
+        overlay_logical_size: manifest.assets.overlay_logical_size,
+        storage_logical_size: manifest.assets.storage_logical_size,
+        overlay_gb,
+        storage_gb,
     }
 }
 
@@ -3411,7 +3588,9 @@ impl CreateCmd {
         // /bin/sh (mirrors pack_run + the serve API create path).
         struct VmModeSeed {
             overlay_template: Option<String>,
+            overlay_source_size: Option<u64>,
             storage_template: Option<String>,
+            storage_source_size: Option<u64>,
             overlay_logical_size: Option<u64>,
             storage_logical_size: Option<u64>,
         }
@@ -3423,17 +3602,40 @@ impl CreateCmd {
                     .overlay_template
                     .as_ref()
                     .map(|t| t.path.clone()),
+                overlay_source_size: manifest.assets.overlay_template.as_ref().map(|t| t.size),
                 storage_template: manifest
                     .assets
                     .storage_template
                     .as_ref()
                     .map(|t| t.path.clone()),
+                storage_source_size: manifest.assets.storage_template.as_ref().map(|t| t.size),
                 overlay_logical_size: manifest.assets.overlay_logical_size,
                 storage_logical_size: manifest.assets.storage_logical_size,
             })
         } else {
             None
         };
+
+        let installed_base_root =
+            smolvm::storage::shared_vm_base_root_from_env().map_err(|error| {
+                smolvm::Error::config("resolve shared VM base directory", error.to_string())
+            })?;
+        if installed_base_root.is_some() && vm_seed.is_none() {
+            return Err(smolvm::Error::config(
+                "create from operator-installed VM base",
+                "SMOLVM_SHARED_VM_BASE_DIR supports only full-disk VM-mode artifacts",
+            ));
+        }
+        let installed_artifact_sha256 = if installed_base_root.is_some() {
+            Some(
+                smolvm_pack::extract::hash_artifact_sha256(sidecar_path).map_err(|error| {
+                    smolvm::Error::agent("hash installed VM base artifact", error.to_string())
+                })?,
+            )
+        } else {
+            None
+        };
+        let uses_installed_vm_base = installed_base_root.is_some();
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -3626,7 +3828,8 @@ impl CreateCmd {
             // source would attach an extra virtiofs device and change the
             // captured device topology. The payload is private to the machine
             // after install and no longer depends on the original artifact.
-            source_smolmachine: checkpoint.is_none().then_some(canonical_path),
+            source_smolmachine: (checkpoint.is_none() && !uses_installed_vm_base)
+                .then_some(canonical_path),
         };
 
         let resources = VmResources {
@@ -3677,7 +3880,37 @@ impl CreateCmd {
             // makes manager construction initialize the generic 10/20 GiB disk
             // templates, only for `seed_vm_mode_disks` to discard them below.
             // Image-mode artifacts and checkpoints retain their existing order.
-            let manager = if vm_seed.is_some() {
+            let manager = if let (Some(base_root), Some(artifact_sha256), Some(seed)) = (
+                installed_base_root.as_deref(),
+                installed_artifact_sha256.as_deref(),
+                vm_seed.as_ref(),
+            ) {
+                Some(AgentManager::for_vm_with_prepared_disks(
+                    &name_for_layers,
+                    params.storage_gb,
+                    params.overlay_gb,
+                    |disk_dir| {
+                        smolvm::storage::seed_vm_mode_disks_from_installed_bases(
+                            disk_dir,
+                            base_root,
+                            artifact_sha256,
+                            smolvm::storage::InstalledVmModeDiskSeedSpec {
+                                overlay_template: seed.overlay_template.as_deref(),
+                                overlay_source_size: seed.overlay_source_size,
+                                storage_template: seed.storage_template.as_deref(),
+                                storage_source_size: seed.storage_source_size,
+                                overlay_logical_size: seed.overlay_logical_size,
+                                storage_logical_size: seed.storage_logical_size,
+                                overlay_gb: params.overlay_gb,
+                                storage_gb: params.storage_gb,
+                            },
+                        )
+                        .map_err(|error| {
+                            smolvm::Error::agent("seed installed VM-mode disks", error.to_string())
+                        })
+                    },
+                )?)
+            } else if vm_seed.is_some() {
                 // Preserve the manager's cheap rootfs preflight before any
                 // artifact extraction mutates this machine's data directory.
                 AgentManager::default_rootfs_path()?;
@@ -3691,83 +3924,97 @@ impl CreateCmd {
                 )?)
             };
 
-            let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
-            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            match std::fs::remove_dir_all(&cache_dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(smolvm::Error::agent(
-                        "clear packed layers cache",
-                        e.to_string(),
-                    ));
+            let extracted_pack = if uses_installed_vm_base {
+                None
+            } else {
+                let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
+                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(smolvm::Error::agent(
+                            "clear packed layers cache",
+                            e.to_string(),
+                        ));
+                    }
                 }
-            }
 
-            println!("Extracting .smolmachine assets...");
-            let result = if smolvm_pack::extract::shared_extract_enabled() {
-                #[cfg(target_os = "linux")]
-                {
-                    let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                println!("Extracting .smolmachine assets...");
+                let result = if smolvm_pack::extract::shared_extract_enabled() {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                            sidecar_path,
+                            &footer,
+                            &cache_dir,
+                            false,
+                        )
+                        .map_err(|e| {
+                            smolvm::Error::agent("extract sidecar (shared)", e.to_string())
+                        })?;
+                        Ok((lease.shared_dir, Some(lease.artifact_sha256)))
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    unreachable!("shared pack extraction is Linux-only")
+                } else {
+                    smolvm_pack::extract::extract_sidecar(
                         sidecar_path,
-                        &footer,
                         &cache_dir,
+                        &footer,
+                        false,
                         false,
                     )
-                    .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
-                    Ok((lease.shared_dir, Some(lease.artifact_sha256)))
-                }
-                #[cfg(not(target_os = "linux"))]
-                unreachable!("shared pack extraction is Linux-only")
-            } else {
-                smolvm_pack::extract::extract_sidecar(
-                    sidecar_path,
-                    &cache_dir,
-                    &footer,
-                    false,
-                    false,
-                )
-                .map(|()| (cache_dir.clone(), None::<String>))
-                .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
+                    .map(|()| (cache_dir.clone(), None::<String>))
+                    .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
+                };
+                // Detach unconditionally: extraction mounts the case-sensitive volume on
+                // macOS even when it later fails, so the detach must run on both success
+                // and failure paths to honor the "mounted iff running" invariant.
+                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                Some(result?)
             };
-            // Detach unconditionally: extraction mounts the case-sensitive volume on
-            // macOS even when it later fails, so the detach must run on both success
-            // and failure paths to honor the "mounted iff running" invariant.
-            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            let (pack_content_dir, artifact_sha256) = result?;
 
             // VM-mode disks now exist, so construction resolves their qcow2/raw
             // format without touching the generic blank-disk templates. Keep the
             // manager alive through publication, matching the original lifetime.
             let _manager = match (manager, vm_seed.as_ref()) {
                 (Some(manager), _) => manager,
-                (None, Some(seed)) => AgentManager::for_vm_with_prepared_disks(
-                    &name_for_layers,
-                    params.storage_gb,
-                    params.overlay_gb,
-                    |disk_dir| {
-                        smolvm::storage::seed_vm_mode_disks(
-                            disk_dir,
-                            &pack_content_dir,
-                            smolvm::storage::VmModeDiskSeedSpec {
-                                artifact_sha256: artifact_sha256.as_deref(),
-                                overlay_template: seed.overlay_template.as_deref(),
-                                storage_template: seed.storage_template.as_deref(),
-                                overlay_logical_size: seed.overlay_logical_size,
-                                storage_logical_size: seed.storage_logical_size,
-                                overlay_gb: params.overlay_gb,
-                                storage_gb: params.storage_gb,
-                            },
-                        )
-                        .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))
-                    },
-                )?,
+                (None, Some(seed)) => {
+                    let (pack_content_dir, artifact_sha256) = extracted_pack
+                        .as_ref()
+                        .expect("non-installed VM-mode artifacts are extracted");
+                    AgentManager::for_vm_with_prepared_disks(
+                        &name_for_layers,
+                        params.storage_gb,
+                        params.overlay_gb,
+                        |disk_dir| {
+                            smolvm::storage::seed_vm_mode_disks(
+                                disk_dir,
+                                pack_content_dir,
+                                smolvm::storage::VmModeDiskSeedSpec {
+                                    artifact_sha256: artifact_sha256.as_deref(),
+                                    overlay_template: seed.overlay_template.as_deref(),
+                                    storage_template: seed.storage_template.as_deref(),
+                                    overlay_logical_size: seed.overlay_logical_size,
+                                    storage_logical_size: seed.storage_logical_size,
+                                    overlay_gb: params.overlay_gb,
+                                    storage_gb: params.storage_gb,
+                                },
+                            )
+                            .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))
+                        },
+                    )?
+                }
                 (None, None) => unreachable!("only VM-mode artifacts defer the manager"),
             };
 
             if let Some(ref checkpoint) = checkpoint {
+                let (pack_content_dir, _) = extracted_pack
+                    .as_ref()
+                    .expect("checkpoint transport artifacts are extracted");
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
-                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                smolvm::portable_checkpoint::install(pack_content_dir, &vm_data_dir, checkpoint)?;
                 smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
             }
 

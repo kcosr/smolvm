@@ -1047,6 +1047,22 @@ pub fn extract_sidecar(
     extract_sidecar_capped(sidecar_path, cache_dir, footer, force, debug, true)
 }
 
+/// Extract a sidecar without applying the user-cache LRU policy.
+///
+/// Operator installation uses a private temporary directory that is discarded
+/// immediately after immutable disk bases are published. Running the ordinary
+/// cache eviction policy against that directory's parent would be both
+/// unnecessary and unsafe.
+pub fn extract_sidecar_uncapped(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    force: bool,
+    debug: bool,
+) -> std::io::Result<()> {
+    extract_sidecar_capped(sidecar_path, cache_dir, footer, force, debug, false)
+}
+
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
 /// `cache_dir.parent()` after a successful extraction.
 ///
@@ -1253,7 +1269,12 @@ fn shared_artifact_source_path(shared_dir: &Path) -> PathBuf {
     shared_dir.with_extension("artifact-source.json")
 }
 
-fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
+/// Stream a complete `.smolmachine` sidecar and return its lowercase SHA-256.
+///
+/// The footer checksum is CRC32 for format compatibility. Callers that publish
+/// long-lived, content-addressed disk bases use this collision-resistant
+/// identity instead.
+pub fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     let mut source = File::open(sidecar_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 4 * 1024 * 1024];
