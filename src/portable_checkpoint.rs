@@ -1029,10 +1029,26 @@ fn stage_checkpoint_disk_layer(
 
     // Terminal raw backings are immutable and carry no header to rewrite. An
     // owned hard link is an exact O(1) snapshot and survives source deletion.
-    match std::fs::hard_link(source, staged) {
+    // Linux's protected-hardlink policy can reject linking a readable,
+    // root-owned backing, so permission failures take a private clone too.
+    link_or_clone_checkpoint_backing(
+        || std::fs::hard_link(source, staged),
+        || crate::disk_utils::clone_or_copy_file(source, staged),
+    )
+}
+
+fn link_or_clone_checkpoint_backing<Link, Clone>(link: Link, clone_or_copy: Clone) -> Result<()>
+where
+    Link: FnOnce() -> std::io::Result<()>,
+    Clone: FnOnce() -> Result<()>,
+{
+    match link() {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            crate::disk_utils::clone_or_copy_file(source, staged)
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EXDEV) =>
+        {
+            clone_or_copy()
         }
         Err(error) => Err(Error::agent("stage checkpoint disk", error.to_string())),
     }
@@ -1799,6 +1815,60 @@ mod tests {
             std::fs::metadata(&source).unwrap().ino(),
             std::fs::metadata(&raw_staged).unwrap().ino()
         );
+    }
+
+    #[test]
+    fn terminal_raw_backing_falls_back_when_hard_link_is_not_permitted() {
+        for link_error in [
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "protected hard link"),
+            std::io::Error::from_raw_os_error(libc::EXDEV),
+        ] {
+            let cloned = std::cell::Cell::new(false);
+            link_or_clone_checkpoint_backing(
+                || Err(link_error),
+                || {
+                    cloned.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(cloned.get());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_raw_backing_falls_back_for_protected_hardlink_errnos() {
+        for errno in [libc::EPERM, libc::EACCES] {
+            let link_error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(link_error.kind(), std::io::ErrorKind::PermissionDenied);
+            let cloned = std::cell::Cell::new(false);
+            link_or_clone_checkpoint_backing(
+                || Err(link_error),
+                || {
+                    cloned.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(cloned.get());
+        }
+    }
+
+    #[test]
+    fn terminal_raw_backing_preserves_unexpected_hard_link_errors() {
+        let cloned = std::cell::Cell::new(false);
+        let error = link_or_clone_checkpoint_backing(
+            || Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            || {
+                cloned.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!cloned.get());
+        assert!(error.to_string().contains("stage checkpoint disk"));
     }
 
     #[test]
