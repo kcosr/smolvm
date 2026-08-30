@@ -2782,7 +2782,7 @@ pub(crate) async fn delete_one(
     request_body = ResizeMachineRequest,
     responses(
         (status = 200, description = "Machine resized", body = MachineInfo),
-        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 400, description = "Invalid or unsupported resize request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 409, description = "Machine is running", body = ApiErrorResponse),
         (status = 500, description = "Resize failed", body = ApiErrorResponse)
@@ -2875,7 +2875,7 @@ pub async fn resize_machine(
         .filter(|size| *size > current_overlay_gb)
         .map(|size| (manager.overlay_path(), size));
     expand_requested_disks(storage_expansion, overlay_expansion)
-        .map_err(|e| ApiError::internal(format!("failed to expand machine disks: {}", e)))?;
+        .map_err(classify_resize_expansion_error)?;
 
     let (storage_gb, overlay_gb) = (req.storage_gb, req.overlay_gb);
     let record = state
@@ -2893,6 +2893,15 @@ pub async fn resize_machine(
         })?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+fn classify_resize_expansion_error(error: SmolvmError) -> ApiError {
+    match error {
+        unsupported @ SmolvmError::UnsupportedDiskResize { .. } => {
+            ApiError::BadRequest(unsupported.to_string())
+        }
+        other => ApiError::internal(other),
+    }
 }
 
 /// Where the export subprocess writes its executable stub. `pack create -o X` derives the
@@ -3859,6 +3868,36 @@ mod tests {
         };
         let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_resize_qcow2_is_bad_request_and_leaves_record_unchanged() {
+        let (_dir, state) = setup_test_state();
+        let name = format!("resize-qcow2-{}", generate_machine_name());
+        create_test_vm(state.db(), &name, Some(20), Some(5));
+
+        let vm_dir = crate::agent::ensure_vm_dir(&name).unwrap();
+        let storage_path = vm_dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        let storage_qcow2 = storage_path.with_extension("qcow2");
+        std::fs::write(&storage_qcow2, b"QFI\xfbunchanged").unwrap();
+        std::fs::write(
+            vm_dir.join(crate::storage::OVERLAY_DISK_FILENAME),
+            b"raw-overlay",
+        )
+        .unwrap();
+
+        let req = ResizeMachineRequest {
+            storage_gb: Some(30),
+            overlay_gb: None,
+        };
+        let result = resize_machine(State(state.clone()), Path(name.clone()), Json(req)).await;
+
+        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+        let unchanged = state.db().get_vm(&name).unwrap().unwrap();
+        assert_eq!(unchanged.storage_gb, Some(20));
+        assert_eq!(std::fs::read(&storage_qcow2).unwrap(), b"QFI\xfbunchanged");
+
+        std::fs::remove_dir_all(vm_dir).unwrap();
     }
 
     /// Helper to create a VM record in the database.

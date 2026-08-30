@@ -2724,8 +2724,7 @@ pub fn expand_disks(
     let overlay_expansion = new_overlay_gb
         .filter(|size| *size > current_overlay_gb)
         .map(|size| (manager.overlay_path(), size));
-    expand_requested_disks(storage_expansion, overlay_expansion)
-        .map_err(|e| smolvm::Error::storage("expand machine disks", e.to_string()))?;
+    expand_requested_disks(storage_expansion, overlay_expansion)?;
 
     let mut changes = Vec::new();
 

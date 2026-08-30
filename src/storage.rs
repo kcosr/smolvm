@@ -24,6 +24,7 @@ pub use crate::data::storage::{
 use crate::disk_utils;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -863,25 +864,57 @@ pub type OverlayDisk = VmDisk<Overlay>;
 
 /// Expand a disk image at an arbitrary path for a specific disk type.
 pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
-    validate_expand_disk_path(path)?;
-    disk_utils::expand_sparse_disk::<D>(path, new_size_gb)
+    validate_expand_disk_path::<D>(path)?;
+    expand_raw_disk::<D>(path, new_size_gb)
 }
 
 /// Reject disk formats that the raw sparse-file expansion cannot resize.
 ///
 /// Qcow2 virtual size is stored in the image metadata. Extending the host file
 /// does not grow the guest disk, so refuse before modifying the image.
-pub fn validate_expand_disk_path(path: &Path) -> Result<()> {
-    if path.extension().and_then(|extension| extension.to_str()) == Some("qcow2") {
-        return Err(Error::storage(
-            "expand disk",
-            format!(
-                "qcow2 disk resize is not supported; refusing to modify {}",
-                path.display()
-            ),
-        ));
+pub fn validate_expand_disk_path<D: DiskType>(path: &Path) -> Result<()> {
+    let has_qcow2_extension =
+        path.extension().and_then(|extension| extension.to_str()) == Some("qcow2");
+    let has_qcow2_header = if has_qcow2_extension {
+        false
+    } else {
+        has_qcow2_magic(path).map_err(|error| {
+            Error::storage(
+                format!("inspect {} disk format", D::NAME),
+                format!("{}: {error}", path.display()),
+            )
+        })?
+    };
+    if has_qcow2_extension || has_qcow2_header {
+        return Err(Error::UnsupportedDiskResize {
+            disk: D::NAME,
+            path: path.to_path_buf(),
+            format: "qcow2",
+        });
     }
     Ok(())
+}
+
+fn has_qcow2_magic(path: &Path) -> std::io::Result<bool> {
+    const QCOW2_MAGIC: [u8; 4] = [b'Q', b'F', b'I', 0xfb];
+
+    let mut file = std::fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == QCOW2_MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn expand_raw_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
+    disk_utils::expand_sparse_disk::<D>(path, new_size_gb).map_err(|error| match error {
+        Error::Storage { reason, .. } => Error::storage(
+            format!("expand {} disk", D::NAME),
+            format!("{}: {reason}", path.display()),
+        ),
+        other => other,
+    })
 }
 
 /// Expand the requested machine disks after validating every target.
@@ -892,18 +925,18 @@ pub fn expand_requested_disks(
     storage: Option<(&Path, u64)>,
     overlay: Option<(&Path, u64)>,
 ) -> Result<()> {
-    for path in [storage.map(|(path, _)| path), overlay.map(|(path, _)| path)]
-        .into_iter()
-        .flatten()
-    {
-        validate_expand_disk_path(path)?;
+    if let Some((path, _)) = storage {
+        validate_expand_disk_path::<Storage>(path)?;
+    }
+    if let Some((path, _)) = overlay {
+        validate_expand_disk_path::<Overlay>(path)?;
     }
 
     if let Some((path, size_gb)) = storage {
-        expand_disk::<Storage>(path, size_gb)?;
+        expand_raw_disk::<Storage>(path, size_gb)?;
     }
     if let Some((path, size_gb)) = overlay {
-        expand_disk::<Overlay>(path, size_gb)?;
+        expand_raw_disk::<Overlay>(path, size_gb)?;
     }
     Ok(())
 }
@@ -1456,9 +1489,7 @@ mod tests {
 
         let error = expand_disk::<Storage>(&disk_path, 2).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("qcow2 disk resize is not supported"));
+        assert!(error.to_string().contains("resize is not supported"));
         assert_eq!(
             std::fs::metadata(&disk_path).unwrap().len(),
             original.len() as u64
@@ -1470,6 +1501,26 @@ mod tests {
             .read_exact(&mut actual)
             .unwrap();
         assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn expand_disk_rejects_qcow2_magic_without_qcow2_extension() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let disk_path = temp_dir.path().join("storage.raw");
+        let original = b"QFI\xfbunchanged-qcow2-data";
+        std::fs::write(&disk_path, original).unwrap();
+
+        let error = expand_disk::<Storage>(&disk_path, 2).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UnsupportedDiskResize {
+                disk: "storage",
+                format: "qcow2",
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(&disk_path).unwrap(), original);
     }
 
     #[test]
@@ -1488,14 +1539,37 @@ mod tests {
         let error =
             expand_requested_disks(Some((&storage_path, 2)), Some((&overlay_path, 1))).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("qcow2 disk resize is not supported"));
+        assert!(matches!(
+            error,
+            Error::UnsupportedDiskResize {
+                disk: "overlay",
+                format: "qcow2",
+                ..
+            }
+        ));
         assert_eq!(
             std::fs::metadata(&storage_path).unwrap().len(),
             BYTES_PER_GIB
         );
         assert_eq!(std::fs::read(&overlay_path).unwrap(), overlay_original);
+    }
+
+    #[test]
+    fn requested_disk_expansion_preserves_disk_context_without_nested_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_path = temp_dir.path().join("custom-storage.img");
+        std::fs::write(&storage_path, b"raw-storage").unwrap();
+
+        let error = expand_requested_disks(Some((&storage_path, u64::MAX)), None).unwrap_err();
+
+        match error {
+            Error::Storage { operation, reason } => {
+                assert_eq!(operation, "expand storage disk");
+                assert!(reason.contains(&storage_path.display().to_string()));
+                assert!(!reason.contains("storage operation failed"));
+            }
+            other => panic!("expected contextual storage error, got {other}"),
+        }
     }
 
     #[test]

@@ -114,6 +114,20 @@ pub enum Error {
         reason: String,
     },
 
+    /// A disk image format cannot be resized safely by smolvm.
+    #[error(
+        "{disk} disk resize is not supported for {format} image {}",
+        path.display()
+    )]
+    UnsupportedDiskResize {
+        /// Logical disk role (for example, `storage` or `overlay`).
+        disk: &'static str,
+        /// Path to the unsupported disk image.
+        path: PathBuf,
+        /// Detected disk image format.
+        format: &'static str,
+    },
+
     /// Disk not found at expected path.
     #[error("disk not found: {}", path.display())]
     DiskNotFound {
