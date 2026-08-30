@@ -735,7 +735,8 @@ fn prepare_cow_base(
     let sequence = COW_BASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let staging_dir = digest_dir.join(format!(".{key}.tmp-{}-{sequence}", std::process::id()));
     let result = (|| {
-        std::fs::create_dir(&staging_dir)?;
+        let mut staging_builder = std::fs::DirBuilder::new();
+        staging_builder.mode(0o700).create(&staging_dir)?;
         let base = staging_dir.join("base.raw");
         crate::disk_utils::clone_or_copy_file(source, &base)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -954,6 +955,7 @@ fn publish_installed_release(
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(0o600)
             .open(&staging)?;
         use std::io::Write as _;
         file.write_all(&bytes)?;
