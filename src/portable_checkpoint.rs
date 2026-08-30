@@ -1841,9 +1841,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_raw_backing_falls_back_for_protected_hardlink_errnos() {
-        for errno in [libc::EPERM, libc::EACCES] {
+        for (errno, expected_kind) in [
+            (libc::EPERM, std::io::ErrorKind::PermissionDenied),
+            (libc::EACCES, std::io::ErrorKind::PermissionDenied),
+            (libc::EXDEV, std::io::ErrorKind::CrossesDevices),
+        ] {
             let link_error = std::io::Error::from_raw_os_error(errno);
-            assert_eq!(link_error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(link_error.kind(), expected_kind);
             let cloned = std::cell::Cell::new(false);
             link_or_clone_checkpoint_backing(
                 || Err(link_error),
