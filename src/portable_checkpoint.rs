@@ -1045,8 +1045,10 @@ where
     match link() {
         Ok(()) => Ok(()),
         Err(error)
-            if error.kind() == std::io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EXDEV) =>
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::CrossesDevices
+            ) =>
         {
             clone_or_copy()
         }
@@ -1821,7 +1823,7 @@ mod tests {
     fn terminal_raw_backing_falls_back_when_hard_link_is_not_permitted() {
         for link_error in [
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "protected hard link"),
-            std::io::Error::from_raw_os_error(libc::EXDEV),
+            std::io::Error::new(std::io::ErrorKind::CrossesDevices, "cross-device link"),
         ] {
             let cloned = std::cell::Cell::new(false);
             link_or_clone_checkpoint_backing(
