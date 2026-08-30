@@ -114,7 +114,11 @@ fn smolmachine_egress_fields(
     allow_cidrs: Vec<String>,
     cli_network: bool,
     dns_filter_hosts: Option<Vec<String>>,
+    cli_no_network: bool,
 ) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
+    if cli_no_network {
+        return (false, None, None);
+    }
     let allowed_cidrs = if allow_cidrs.is_empty() {
         None
     } else {
@@ -125,6 +129,29 @@ fn smolmachine_egress_fields(
         allowed_cidrs,
         dns_filter_hosts,
     )
+}
+
+fn smolmachine_resource_fields(
+    manifest_cpus: u8,
+    manifest_mem: u32,
+    cli_cpus: Option<u8>,
+    cli_mem: Option<u32>,
+) -> (u8, u32) {
+    (
+        cli_cpus.unwrap_or(manifest_cpus),
+        cli_mem.unwrap_or(manifest_mem),
+    )
+}
+
+fn apply_no_network_override(params: &mut vm_common::CreateVmParams, no_net: bool) {
+    if no_net {
+        params.net = false;
+        params.allowed_cidrs = None;
+        params.dns_filter_hosts = None;
+        params.dns = None;
+        params.network_name = None;
+        params.network_backend = None;
+    }
 }
 
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
@@ -591,11 +618,13 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub rosetta: bool,
 
-    /// Number of virtual CPUs
+    /// Number of virtual CPUs; inherits the Smolfile/artifact value when omitted,
+    /// otherwise defaults to 4
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
     pub cpus: u8,
 
-    /// Memory allocation in MiB
+    /// Memory allocation in MiB; inherits the Smolfile/artifact value when
+    /// omitted, otherwise defaults to 8192
     #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB", help_heading = "Resources")]
     pub mem: u32,
 
@@ -1145,8 +1174,8 @@ impl RunCmd {
             self.image.clone(),
             None,
             self.command.clone(),
-            self.cpus,
-            self.mem,
+            (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
+            (self.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(self.mem),
             self.volume,
             self.port,
             net,
@@ -2239,7 +2268,7 @@ mod tests {
         let cidrs = vec!["192.0.2.10/32".to_string()];
         let hosts = Some(vec!["provider.test".to_string()]);
         assert_eq!(
-            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
+            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone(), false),
             (true, Some(cidrs), hosts)
         );
     }
@@ -2247,9 +2276,114 @@ mod tests {
     #[test]
     fn smolmachine_egress_fields_preserve_manifest_network_default() {
         assert_eq!(
-            smolmachine_egress_fields(true, Vec::new(), false, None),
+            smolmachine_egress_fields(true, Vec::new(), false, None, false),
             (true, None, None)
         );
+    }
+
+    #[test]
+    fn create_from_presence_aware_resource_and_network_overrides_parse() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--from",
+            "/tmp/base.smolmachine",
+            "--cpus",
+            "4",
+            "--mem",
+            "8192",
+            "--no-net",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+
+        assert_eq!(cmd.cpus, Some(DEFAULT_MICROVM_CPU_COUNT));
+        assert_eq!(cmd.mem, Some(DEFAULT_MICROVM_MEMORY_MIB));
+        assert_eq!(
+            smolmachine_resource_fields(12, 32768, cmd.cpus, cmd.mem),
+            (DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB)
+        );
+        assert_eq!(
+            smolmachine_egress_fields(true, Vec::new(), false, None, cmd.no_net),
+            (false, None, None)
+        );
+    }
+
+    #[test]
+    fn create_no_net_conflicts_with_network_enabling_flags() {
+        for flag in [
+            "--net",
+            "--net-backend",
+            "--dns",
+            "--network",
+            "--allow-cidr",
+            "--allow-host",
+            "--outbound-localhost-only",
+        ] {
+            let mut args = vec!["machine", "create", "--no-net", flag];
+            match flag {
+                "--net-backend" => args.push("tsi"),
+                "--dns" => args.push("192.0.2.53"),
+                "--network" => args.push("devnet"),
+                "--allow-cidr" => args.push("192.0.2.0/24"),
+                "--allow-host" => args.push("example.test"),
+                _ => {}
+            }
+            assert!(TestMachineCli::try_parse_from(args).is_err(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn create_no_net_clears_smolfile_network_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "net = true\n[network]\nallow_hosts = [\"example.test\"]\nallow_cidrs = [\"192.0.2.0/24\"]\n",
+        )
+        .unwrap();
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--smolfile",
+            path.to_str().unwrap(),
+            "--no-net",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        let mut params = crate::cli::smolfile::build_create_params(
+            "test-vm".to_string(),
+            None,
+            None,
+            vec![],
+            cmd.cpus,
+            cmd.mem,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            cmd.smolfile,
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+        .unwrap();
+
+        assert!(params.net);
+        assert!(params.allowed_cidrs.is_some());
+        assert!(params.dns_filter_hosts.is_some());
+        apply_no_network_override(&mut params, cmd.no_net);
+        assert!(!params.net);
+        assert_eq!(params.allowed_cidrs, None);
+        assert_eq!(params.dns_filter_hosts, None);
     }
 
     #[test]
@@ -2553,7 +2687,7 @@ mod tests {
             panic!("expected machine create command");
         };
         // They configured nothing: the machine still has the defaults.
-        assert_eq!(cmd.mem, DEFAULT_MICROVM_MEMORY_MIB);
+        assert_eq!(cmd.mem, None);
         assert_eq!(cmd.storage, None);
         assert!(!cmd.net);
         assert_eq!(
@@ -3039,12 +3173,12 @@ pub struct CreateCmd {
     pub max_image_size: Option<u64>,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
-    pub cpus: u8,
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB")]
-    pub mem: u32,
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
 
     /// Storage disk size in GiB (for OCI layers and container data)
     #[arg(long, value_name = "GiB")]
@@ -3070,6 +3204,21 @@ pub struct CreateCmd {
     /// Enable outbound network access
     #[arg(long)]
     pub net: bool,
+
+    /// Disable outbound network access, overriding an artifact or Smolfile
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "net",
+            "net_backend",
+            "dns",
+            "network_name",
+            "allow_cidr",
+            "allow_host",
+            "outbound_localhost_only"
+        ]
+    )]
+    pub no_net: bool,
 
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum)]
@@ -3281,6 +3430,7 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        apply_no_network_override(&mut params, self.no_net);
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -3350,8 +3500,6 @@ impl CreateCmd {
 
     /// Create a machine from a .smolmachine artifact.
     fn run_from_smolmachine(&self, sidecar_path: &std::path::Path) -> smolvm::Result<()> {
-        use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-
         if !sidecar_path.exists() {
             return Err(smolvm::Error::config(
                 "create from .smolmachine",
@@ -3368,6 +3516,7 @@ impl CreateCmd {
             let topology_overridden = !self.volume.is_empty()
                 || !self.port.is_empty()
                 || self.net
+                || self.no_net
                 || self.net_backend.is_some()
                 || self.dns.is_some()
                 || self.network_name.is_some()
@@ -3451,16 +3600,8 @@ impl CreateCmd {
         let name_for_layers = name.clone();
 
         // CLI flags override manifest defaults.
-        let cpus = if self.cpus != DEFAULT_MICROVM_CPU_COUNT {
-            self.cpus
-        } else {
-            manifest.cpus
-        };
-        let mem = if self.mem != DEFAULT_MICROVM_MEMORY_MIB {
-            self.mem
-        } else {
-            manifest.mem
-        };
+        let (cpus, mem) =
+            smolmachine_resource_fields(manifest.cpus, manifest.mem, self.cpus, self.mem);
         if let Some(ref checkpoint) = checkpoint {
             if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
                 return Err(smolvm::Error::config(
@@ -3484,6 +3625,7 @@ impl CreateCmd {
             cli_allow_cidrs,
             cli_network,
             cli_dns_filter_hosts,
+            self.no_net,
         );
         let checkpoint_network = checkpoint
             .as_ref()

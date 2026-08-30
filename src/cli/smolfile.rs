@@ -22,7 +22,7 @@ pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
-/// to Smolfile values. For scalar fields, non-default CLI values take priority.
+/// to Smolfile values. For scalar fields, present CLI values take priority.
 ///
 /// Merge precedence:
 ///   image:      CLI > Smolfile > None (bare Alpine)
@@ -36,8 +36,8 @@ pub fn build_create_params(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cmd: Vec<String>,
-    cli_cpus: u8,
-    cli_mem: u32,
+    cli_cpus: Option<u8>,
+    cli_mem: Option<u32>,
     cli_volume: Vec<String>,
     cli_port: Vec<PortMappingSpec>,
     cli_net: bool,
@@ -74,8 +74,8 @@ pub fn build_create_params(
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
                 cmd: cli_cmd,
-                cpus: cli_cpus,
-                mem: cli_mem,
+                cpus: cli_cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+                mem: cli_mem.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
                 volume: cli_volume,
                 port: ports,
                 net,
@@ -200,21 +200,10 @@ pub fn build_create_params(
     // Workdir: CLI > [dev].workdir > top-level workdir
     let dev_workdir = dev.workdir;
 
-    // Scalars: CLI non-default overrides Smolfile
-    let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
-    let default_mem = DEFAULT_MICROVM_MEMORY_MIB;
-
-    let cpus = if cli_cpus != default_cpus {
-        cli_cpus
-    } else {
-        sf.cpus.unwrap_or(cli_cpus)
-    };
-
-    let mem = if cli_mem != default_mem {
-        cli_mem
-    } else {
-        sf.memory.unwrap_or(cli_mem)
-    };
+    // An explicitly supplied CLI value wins even when it happens to equal the
+    // built-in default.
+    let cpus = cli_cpus.or(sf.cpus).unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
+    let mem = cli_mem.or(sf.memory).unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
 
     let net = if cli_net {
         true
@@ -496,13 +485,21 @@ mod tests {
     use smolvm::data::network::PortMapping;
 
     fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
+        build_from_smolfile_with_resources(path, None, None)
+    }
+
+    fn build_from_smolfile_with_resources(
+        path: PathBuf,
+        cpus: Option<u8>,
+        mem: Option<u32>,
+    ) -> smolvm::Result<CreateVmParams> {
         build_create_params(
             "test-vm".to_string(),
             None,
             None,
             vec![],
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            cpus,
+            mem,
             vec![],
             vec![],
             false,
@@ -518,6 +515,23 @@ mod tests {
             vec![],
             Default::default(),
         )
+    }
+
+    #[test]
+    fn explicit_default_resources_override_different_smolfile_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "cpus = 12\nmemory = 32768\n").unwrap();
+
+        let params = build_from_smolfile_with_resources(
+            path,
+            Some(DEFAULT_MICROVM_CPU_COUNT),
+            Some(DEFAULT_MICROVM_MEMORY_MIB),
+        )
+        .unwrap();
+
+        assert_eq!(params.cpus, DEFAULT_MICROVM_CPU_COUNT);
+        assert_eq!(params.mem, DEFAULT_MICROVM_MEMORY_MIB);
     }
 
     #[test]
@@ -553,8 +567,8 @@ mod tests {
             None,
             None,
             vec![],
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
+            None,
+            None,
             vec![],
             vec![],
             false,
