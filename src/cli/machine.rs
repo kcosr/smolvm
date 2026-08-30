@@ -501,12 +501,7 @@ impl InstallBaseCmd {
                 smolvm_pack::packer::read_manifest_from_sidecar(&snapshot).map_err(|error| {
                     smolvm::Error::agent("read VM base manifest", error.to_string())
                 })?;
-            if manifest.mode != smolvm_pack::PackMode::Vm {
-                return Err(smolvm::Error::config(
-                    "install shared VM base",
-                    "only full-disk VM-mode artifacts can be installed",
-                ));
-            }
+            validate_install_base_manifest(&manifest)?;
             let footer = smolvm_pack::packer::read_footer_from_sidecar(&snapshot)
                 .map_err(|error| smolvm::Error::agent("read VM base footer", error.to_string()))?;
             let artifact_sha256 =
@@ -533,6 +528,29 @@ impl InstallBaseCmd {
             Ok(())
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_install_base_manifest(manifest: &smolvm_pack::PackManifest) -> smolvm::Result<()> {
+    if manifest.mode != smolvm_pack::PackMode::Vm {
+        return Err(smolvm::Error::config(
+            "install shared VM base",
+            "only full-disk VM-mode artifacts can be installed",
+        ));
+    }
+    if manifest.checkpoint.is_some() {
+        return Err(smolvm::Error::config(
+            "install shared VM base",
+            "portable checkpoint artifacts cannot be installed as shared VM bases",
+        ));
+    }
+    if manifest.assets.overlay_template.is_none() {
+        return Err(smolvm::Error::config(
+            "install shared VM base",
+            "VM-mode artifact must contain an overlay disk template",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -577,6 +595,7 @@ fn snapshot_operator_artifact(source: &Path, staging: &Path) -> smolvm::Result<P
     Ok(snapshot)
 }
 
+#[cfg(target_os = "linux")]
 fn installed_vm_seed<'a>(
     manifest: &'a smolvm_pack::PackManifest,
     overlay_gb: Option<u64>,
@@ -2311,6 +2330,82 @@ mod tests {
 
     use super::*;
     use clap::Parser;
+
+    #[cfg(target_os = "linux")]
+    fn installable_vm_manifest() -> smolvm_pack::PackManifest {
+        let mut manifest = smolvm_pack::PackManifest::new(
+            "vm://golden".to_string(),
+            "none".to_string(),
+            "linux/x86_64".to_string(),
+            "linux/x86_64".to_string(),
+        );
+        manifest.mode = smolvm_pack::PackMode::Vm;
+        manifest.assets.overlay_template = Some(smolvm_pack::format::AssetEntry {
+            path: "overlay.raw".to_string(),
+            size: 4096,
+        });
+        manifest
+    }
+
+    #[cfg(target_os = "linux")]
+    fn checkpoint_asset(path: &str) -> smolvm_pack::format::CheckpointAsset {
+        smolvm_pack::format::CheckpointAsset {
+            path: path.to_string(),
+            size: 0,
+            sha256: String::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_base_manifest_requires_vm_mode_and_overlay_template() {
+        let valid = installable_vm_manifest();
+        validate_install_base_manifest(&valid).unwrap();
+
+        let mut container = valid.clone();
+        container.mode = smolvm_pack::PackMode::Container;
+        assert!(validate_install_base_manifest(&container)
+            .unwrap_err()
+            .to_string()
+            .contains("only full-disk VM-mode artifacts"));
+
+        let mut missing_overlay = valid;
+        missing_overlay.assets.overlay_template = None;
+        assert!(validate_install_base_manifest(&missing_overlay)
+            .unwrap_err()
+            .to_string()
+            .contains("must contain an overlay disk template"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_base_manifest_rejects_portable_checkpoints() {
+        let mut manifest = installable_vm_manifest();
+        manifest.checkpoint = Some(smolvm_pack::format::PortableCheckpointManifest {
+            version: 1,
+            runtime_abi: "test".to_string(),
+            host_platform: "linux/x86_64".to_string(),
+            cpu_contract: smolvm_pack::format::CheckpointCpuContract::ExactV1 {
+                fingerprint: "test".to_string(),
+            },
+            cpus: 1,
+            memory_mib: 256,
+            storage_gib: None,
+            overlay_gib: None,
+            device_profile: "test".to_string(),
+            state: checkpoint_asset("checkpoint/state"),
+            memory: checkpoint_asset("checkpoint/memory"),
+            layout: checkpoint_asset("checkpoint/layout"),
+            disks: Vec::new(),
+            workload: None,
+            network: None,
+        });
+
+        assert!(validate_install_base_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("portable checkpoint artifacts cannot be installed"));
+    }
 
     #[test]
     fn cli_overlay_owner_uses_the_golden_for_fork_clones() {

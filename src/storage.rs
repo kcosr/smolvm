@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -700,7 +700,22 @@ fn prepare_cow_base(
         .create(true)
         .write(true)
         .truncate(false)
-        .open(lock_path)?;
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("open COW base lock {}: {error}", lock_path.display()),
+            )
+        })?;
+    lock_file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("secure COW base lock {}: {error}", lock_path.display()),
+            )
+        })?;
     let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
     if lock_result != 0 {
         return Err(std::io::Error::last_os_error());
@@ -755,23 +770,43 @@ fn prepare_cow_base(
 fn validate_cow_base(base_dir: &Path, expected: &CowBaseMetadata) -> std::io::Result<PathBuf> {
     let base = base_dir.join("base.raw");
     let metadata_path = base_dir.join("metadata.json");
-    let actual: CowBaseMetadata =
-        serde_json::from_slice(&std::fs::read(&metadata_path)?).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "corrupt COW base metadata {}: {error}",
-                    metadata_path.display()
-                ),
-            )
-        })?;
+    let metadata_bytes = std::fs::read(&metadata_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "read COW base metadata {} for {}-{}: {error}",
+                metadata_path.display(),
+                expected.disk_type,
+                expected.logical_size
+            ),
+        )
+    })?;
+    let actual: CowBaseMetadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "corrupt COW base metadata {}: {error}",
+                metadata_path.display()
+            ),
+        )
+    })?;
     if &actual != expected {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("COW base metadata mismatch: {}", base_dir.display()),
         ));
     }
-    let file_metadata = std::fs::metadata(&base)?;
+    let file_metadata = std::fs::metadata(&base).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "inspect COW base {} for {}-{}: {error}",
+                base.display(),
+                expected.disk_type,
+                expected.logical_size
+            ),
+        )
+    })?;
     if !file_metadata.is_file() || file_metadata.len() != expected.logical_size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -784,7 +819,12 @@ fn validate_cow_base(base_dir: &Path, expected: &CowBaseMetadata) -> std::io::Re
             format!("COW base is writable: {}", base.display()),
         ));
     }
-    base.canonicalize()
+    base.canonicalize().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("canonicalize COW base {}: {error}", base.display()),
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -800,7 +840,34 @@ fn prepare_operator_base_root_owned(base_root: &Path, required_owner: u32) -> st
             "shared VM base directory must be absolute",
         ));
     }
-    std::fs::create_dir_all(base_root)?;
+    validate_operator_base_ancestors(base_root, required_owner)?;
+    match std::fs::symlink_metadata(base_root) {
+        Ok(_) => {
+            // Reject an existing symlink or untrusted directory before chmod
+            // could follow it and mutate a different target.
+            validate_operator_base_node(base_root, true, required_owner)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "inspect shared VM base directory {}: {error}",
+                    base_root.display()
+                ),
+            ));
+        }
+    }
+    std::fs::create_dir_all(base_root).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "create shared VM base directory {}: {error}",
+                base_root.display()
+            ),
+        )
+    })?;
+    validate_operator_base_node(base_root, true, required_owner)?;
     std::fs::set_permissions(base_root, std::fs::Permissions::from_mode(0o711))?;
     validate_operator_base_root(base_root, required_owner)
 }
@@ -855,22 +922,52 @@ fn validate_installed_release(
     required_owner: u32,
 ) -> std::io::Result<()> {
     let path = installed_release_path(base_root, expected);
+    let variant = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown release variant");
     let digest_dir = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "installed VM release marker has no parent",
         )
     })?;
-    let digest_metadata = validate_operator_base_node(digest_dir, true, required_owner)?;
+    let digest_metadata =
+        validate_operator_base_node(digest_dir, true, required_owner).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "validate digest directory {} for VM base release {variant}: {error}",
+                    digest_dir.display()
+                ),
+            )
+        })?;
     if !digest_metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid VM base digest directory: {}", digest_dir.display()),
         ));
     }
-    validate_operator_base_node(&path, false, required_owner)?;
+    validate_operator_base_node(&path, false, required_owner).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "validate VM base release marker {variant} at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let marker_bytes = std::fs::read(&path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "read VM base release marker {variant} at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
     let actual: InstalledVmBaseRelease =
-        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+        serde_json::from_slice(&marker_bytes).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("corrupt VM base release marker {}: {error}", path.display()),
@@ -879,7 +976,10 @@ fn validate_installed_release(
     if &actual != expected {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("VM base release marker mismatch: {}", path.display()),
+            format!(
+                "VM base release marker mismatch for {variant}: {}",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -893,6 +993,7 @@ fn validate_operator_base_root(base_root: &Path, required_owner: u32) -> std::io
             "shared VM base directory must be absolute",
         ));
     }
+    validate_operator_base_ancestors(base_root, required_owner)?;
     let metadata = validate_operator_base_node(base_root, true, required_owner)?;
     if !metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
@@ -903,7 +1004,16 @@ fn validate_operator_base_root(base_root: &Path, required_owner: u32) -> std::io
             ),
         ));
     }
-    if base_root.canonicalize()? != base_root {
+    let canonical = base_root.canonicalize().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "canonicalize shared VM base root {}: {error}",
+                base_root.display()
+            ),
+        )
+    })?;
+    if canonical != base_root {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -911,6 +1021,62 @@ fn validate_operator_base_root(base_root: &Path, required_owner: u32) -> std::io
                 base_root.display()
             ),
         ));
+    }
+    Ok(())
+}
+
+/// Validate every existing directory above the operator store. A root-owned
+/// sticky directory (for example `/tmp`) is the sole writable ancestor that is
+/// safe: sticky semantics prevent another uid from replacing the store entry.
+#[cfg(target_os = "linux")]
+fn validate_operator_base_ancestors(base_root: &Path, required_owner: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for ancestor in base_root.ancestors().skip(1) {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "inspect shared VM base ancestor {}: {error}",
+                        ancestor.display()
+                    ),
+                ));
+            }
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "shared VM base ancestor is not a real directory: {}",
+                    ancestor.display()
+                ),
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        let trusted_owner = metadata.uid() == required_owner || metadata.uid() == 0;
+        if !trusted_owner {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "shared VM base ancestor has uid {}, expected {required_owner} or root: {}",
+                    metadata.uid(),
+                    ancestor.display()
+                ),
+            ));
+        }
+        let safe_sticky_directory = metadata.uid() == 0 && mode & 0o1000 != 0;
+        if mode & 0o022 != 0 && !safe_sticky_directory {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "shared VM base ancestor has unsafe write permissions: {}",
+                    ancestor.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -936,7 +1102,15 @@ fn validate_operator_base_path(
             ));
         }
     }
-    let canonical = base_dir.canonicalize()?;
+    let canonical = base_dir.canonicalize().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "canonicalize shared VM base path {}: {error}",
+                base_dir.display()
+            ),
+        )
+    })?;
     if !canonical.starts_with(base_root) || canonical != base_dir {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -954,7 +1128,12 @@ fn validate_operator_base_node(
 ) -> std::io::Result<std::fs::Metadata> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = std::fs::symlink_metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("inspect shared VM base node {}: {error}", path.display()),
+        )
+    })?;
     let expected_type = if directory {
         metadata.file_type().is_dir()
     } else {
@@ -1537,6 +1716,176 @@ mod tests {
         let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
     }
 
+    #[cfg(target_os = "linux")]
+    fn prepare_test_installed_release(
+        temp: &tempfile::TempDir,
+    ) -> (PathBuf, InstalledVmBaseRelease, u32) {
+        let extracted = temp.path().join("operator-staging");
+        let base_root = temp.path().join("installed-bases");
+        std::fs::create_dir_all(&extracted).unwrap();
+        write_sparse_template(&extracted.join("overlay.raw"), 1024 * 1024, b"root");
+        prepare_cow_base(
+            &base_root,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &extracted.join("overlay.raw"),
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        let release = expected_installed_release(
+            TEST_ARTIFACT_SHA256,
+            InstalledVmModeDiskSeedSpec {
+                overlay_template: Some("overlay.raw"),
+                overlay_source_size: Some(1024 * 1024),
+                storage_template: None,
+                storage_source_size: None,
+                overlay_logical_size: Some(2 * 1024 * 1024),
+                storage_logical_size: None,
+                overlay_gb: None,
+                storage_gb: None,
+            },
+        )
+        .unwrap();
+        (base_root, release, unsafe { libc::geteuid() })
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn operator_base_rejects_symlinked_and_untrusted_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let real_parent = temp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = temp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        let through_symlink = linked_parent.join("bases");
+        let error = prepare_operator_base_root_owned(&through_symlink, owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ancestor"));
+        assert!(error
+            .to_string()
+            .contains(&linked_parent.display().to_string()));
+
+        let real_root = temp.path().join("real-root");
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::set_permissions(&real_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_root = temp.path().join("linked-root");
+        symlink(&real_root, &linked_root).unwrap();
+        let error = prepare_operator_base_root_owned(&linked_root, owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains(&linked_root.display().to_string()));
+        assert_eq!(
+            std::fs::metadata(&real_root).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "rejecting a symlinked root must not chmod its target"
+        );
+
+        let trusted_root = temp.path().join("owned-root");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let wrong_owner = if owner == u32::MAX {
+            owner - 1
+        } else {
+            owner + 1
+        };
+        let error = validate_operator_base_root(&trusted_root, wrong_owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("expected"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_release_errors_identify_variant_and_marker_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let (base_root, release, owner) = prepare_test_installed_release(&temp);
+        publish_installed_release(&base_root, &release, owner).unwrap();
+
+        let different_size = expected_installed_release(
+            TEST_ARTIFACT_SHA256,
+            InstalledVmModeDiskSeedSpec {
+                overlay_template: Some("overlay.raw"),
+                overlay_source_size: Some(1024 * 1024),
+                storage_template: None,
+                storage_source_size: None,
+                overlay_logical_size: Some(3 * 1024 * 1024),
+                storage_logical_size: None,
+                overlay_gb: None,
+                storage_gb: None,
+            },
+        )
+        .unwrap();
+        let missing_path = installed_release_path(&base_root, &different_size);
+        let error = validate_installed_release(&base_root, &different_size, owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("release-overlay-3145728.json"));
+        assert!(error
+            .to_string()
+            .contains(&missing_path.display().to_string()));
+
+        let marker = installed_release_path(&base_root, &release);
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mismatched = InstalledVmBaseRelease {
+            version: release.version + 1,
+            artifact_sha256: release.artifact_sha256.clone(),
+            disks: release.disks.clone(),
+        };
+        std::fs::write(&marker, serde_json::to_vec_pretty(&mismatched).unwrap()).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let error = validate_installed_release(&base_root, &release, owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("release marker mismatch"));
+        assert!(error.to_string().contains(&marker.display().to_string()));
+        make_tree_removable(&base_root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_release_publication_is_idempotent_and_concurrent() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (base_root, release, owner) = prepare_test_installed_release(&temp);
+        let release = Arc::new(release);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let base_root = base_root.clone();
+            let release = Arc::clone(&release);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                publish_installed_release(&base_root, &release, owner)
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        publish_installed_release(&base_root, &release, owner).unwrap();
+        let marker = installed_release_path(&base_root, &release);
+        assert_eq!(
+            serde_json::from_slice::<InstalledVmBaseRelease>(&std::fs::read(&marker).unwrap())
+                .unwrap(),
+            *release
+        );
+        assert_eq!(
+            std::fs::read_dir(marker.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".release.tmp-")))
+                .count(),
+            0
+        );
+        make_tree_removable(&base_root);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn vm_mode_cow_uses_tiny_private_disks_and_one_immutable_base() {
@@ -1892,6 +2241,14 @@ mod tests {
                 .filter(|entry| entry.path().is_dir())
                 .count(),
             1
+        );
+        assert_eq!(
+            std::fs::metadata(digest_dir.join("overlay-4194304.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
         make_tree_removable(&cache);
         make_tree_removable(&base_cache);

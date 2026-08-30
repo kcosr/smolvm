@@ -13,11 +13,18 @@ sudo smolvm machine install-base \
   --base-dir /var/lib/smolvm/vm-bases
 ```
 
-The source artifact must itself be a root-owned, non-writable regular file. The
-installer snapshots it through one open file descriptor, hashes and extracts
-that snapshot in private staging, publishes root-owned read-only `base.raw`
-files and a complete release marker below the artifact SHA-256, then removes
-staging. No SmolVM daemon is involved.
+The source artifact must itself be a root-owned, non-writable regular file.
+Every ancestor directory leading to the installed base root must also be
+trusted, root-owned, and not writable by group or other users (a root-owned
+sticky directory such as `/tmp` is permitted). The installer snapshots the
+artifact through one open file descriptor,
+hashes and extracts that snapshot in private staging, publishes root-owned
+read-only `base.raw` files and a complete release marker below the artifact
+SHA-256, then removes staging. Normal failures also clean up staging, but
+`SIGKILL` or host power loss can leave root-only
+`.smolvm-vm-base-install-*`, per-digest `.*.tmp-*`, or `.release.tmp-*`
+staging for the operator to inspect and remove after confirming no installation
+is active. No SmolVM daemon is involved.
 
 If consumers need disks larger than the artifact defaults, install that exact
 variant with `--overlay GIB` and/or `--storage GIB`, then use the same values at
@@ -44,5 +51,10 @@ Operational requirements:
 - Keep an installed artifact version while any user overlay references it.
 - Install a new content-addressed version for upgrades. Existing machines stay
   pinned to their backing paths; newly created machines use the new artifact.
+- There is no automatic base pruning or provenance index. Retain old versions
+  unless a reference-aware audit of every user's private qcow2 backing paths
+  proves that no overlay depends on them. If `qemu-img` is installed,
+  `qemu-img info --backing-chain --output=json PRIVATE_OVERLAY.qcow2` can help
+  inspect each chain; compare resolved backing paths before removing a base.
 - Do not place user records, sockets, locks, or writable overlays in the shared
   directory.
