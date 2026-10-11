@@ -4593,14 +4593,29 @@ fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
             {
                 continue
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring unreadable sibling layers reference {}: {error}",
+                    peer.display()
+                );
+                continue;
+            }
         };
         if metadata.file_type().is_symlink() {
             match fs::canonicalize(&peer) {
                 Ok(target) if target == source => return Ok(true),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A malformed peer or a chain exceeding the OS symlink
+                    // limit must not pin every unrelated machine's volume.
+                    // Valid fork trees retain their direct child reference:
+                    // deleting an ancestor while it has children is refused.
+                    eprintln!(
+                        "warning: ignoring unresolved sibling layers reference {}: {error}",
+                        peer.display()
+                    );
+                }
             }
         }
     }
@@ -8528,14 +8543,44 @@ mod orphan_reap_tests {
     }
 
     #[test]
-    fn unreadable_reference_inventory_is_not_classified_as_unused() {
+    fn broken_sibling_reference_does_not_pin_unrelated_source() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let source = root.join("source/pack");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(root.join("loop")).unwrap();
         std::os::unix::fs::symlink("pack", root.join("loop/pack")).unwrap();
-        assert!(machine_layers_have_dependents(&source).is_err());
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn long_fork_chain_pins_its_source_without_pinning_unrelated_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        let unrelated = root.join("unrelated/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        let mut parent = source.clone();
+        // Exceed OS path-resolution limits. The direct child still proves
+        // ownership, regardless of whether deeper descendants resolve.
+        for index in 0..64 {
+            let child = root.join(format!("child-{index}/pack"));
+            fs::create_dir(child.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&parent, &child).unwrap();
+            parent = child;
+        }
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        assert!(!machine_layers_have_dependents(&unrelated).unwrap());
+    }
+
+    #[test]
+    fn unreadable_source_state_still_rejects_detach() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(machine_layers_have_dependents(&tmp.path().join("missing/pack")).is_err());
     }
 
     /// The reaper must never block: a peer mid-acquire holds its lock, and
@@ -8637,6 +8682,10 @@ mod orphan_reap_tests {
         ensure_cs_volume_mounted(&source, false).unwrap();
         fs::write(source.join(CS_MOUNT_DIR).join("marker"), "source").unwrap();
         std::os::unix::fs::symlink(&source, &child).unwrap();
+        // A broken, unrelated machine must neither release this live source
+        // early nor prevent its eventual detach after the child is removed.
+        fs::create_dir(root.join("broken")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("broken/pack")).unwrap();
         force_detach_layers_volume(&source);
         force_detach_layers_volume(&child);
         assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
