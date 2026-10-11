@@ -499,7 +499,7 @@ pub fn seed_workspace_from_pack() {
         return;
     }
     info!("seeding /workspace from the pack");
-    match extract_layer_tar(&seed, &workspace) {
+    match extract_workspace_seed(&seed, &workspace) {
         Ok(()) => {
             if let Err(e) = std::fs::write(&marker, b"") {
                 warn!(error = %e, "workspace seed: cannot write marker");
@@ -507,6 +507,82 @@ pub fn seed_workspace_from_pack() {
         }
         Err(e) => warn!(error = %e, "workspace seed: extraction failed; workspace left as-is"),
     }
+}
+
+/// BusyBox tar (shipped in the agent rootfs) leaves symlink mtimes at extraction
+/// time. Keep its extraction semantics, then restore just those timestamps from
+/// the archive without following link targets.
+fn extract_workspace_seed(seed: &Path, workspace: &Path) -> Result<()> {
+    extract_layer_tar(seed, workspace)?;
+    restore_workspace_symlink_mtimes(seed, workspace)
+}
+
+fn restore_workspace_symlink_mtimes(seed: &Path, workspace: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let root = workspace.canonicalize()?;
+    let mut archive = tar::Archive::new(std::fs::File::open(seed)?);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if !entry.header().entry_type().is_symlink() {
+            continue;
+        }
+        let path = entry.path()?;
+        if path.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            return Err(StorageError::new("invalid workspace symlink path"));
+        }
+        let destination = root.join(path.as_ref());
+        let parent = destination
+            .parent()
+            .ok_or_else(|| StorageError::new("invalid workspace symlink path"))?
+            .canonicalize()?;
+        if !parent.starts_with(&root) {
+            return Err(StorageError::new(
+                "workspace symlink parent escapes workspace",
+            ));
+        }
+        // A later archive entry may have replaced the link with a regular file.
+        if !std::fs::symlink_metadata(&destination)?
+            .file_type()
+            .is_symlink()
+        {
+            continue;
+        }
+        let mtime = entry
+            .header()
+            .mtime()?
+            .try_into()
+            .map_err(|_| StorageError::new("workspace symlink timestamp out of range"))?;
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: mtime,
+                tv_nsec: 0,
+            },
+        ];
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| StorageError::new("invalid workspace symlink path"))?;
+        // The no-follow flag applies even to dangling or absolute symlinks.
+        if unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }
 
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
@@ -5894,6 +5970,158 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_seed_preserves_link_and_directory_metadata() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let seed = fixture.path().join("workspace.tar");
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let mtime = 946_684_800;
+        let mut archive = tar::Builder::new(std::fs::File::create(&seed).unwrap());
+        for (name, kind, target, mode, bytes) in [
+            ("dir", tar::EntryType::Directory, "", 0o750, &b""[..]),
+            (
+                "dir/file",
+                tar::EntryType::Regular,
+                "",
+                0o751,
+                &b"contents\0\xff"[..],
+            ),
+            (
+                "dir/hard",
+                tar::EntryType::Link,
+                "dir/file",
+                0o751,
+                &b""[..],
+            ),
+            ("dir/link", tar::EntryType::Symlink, "file", 0o777, &b""[..]),
+            (
+                "dir/dangling",
+                tar::EntryType::Symlink,
+                "missing",
+                0o777,
+                &b""[..],
+            ),
+            (
+                ".wh.keep",
+                tar::EntryType::Regular,
+                "",
+                0o640,
+                &b"ordinary file"[..],
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(uid.into());
+            header.set_gid(gid.into());
+            header.set_mtime(mtime);
+            header.set_size(bytes.len() as u64);
+            if !target.is_empty() {
+                header.set_link_name(target).unwrap();
+            }
+            archive.append_data(&mut header, name, bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        super::extract_workspace_seed(&seed, &workspace).unwrap();
+        for name in [
+            "dir",
+            "dir/file",
+            "dir/hard",
+            "dir/link",
+            "dir/dangling",
+            ".wh.keep",
+        ] {
+            let meta = std::fs::symlink_metadata(workspace.join(name)).unwrap();
+            assert_eq!(meta.mtime(), mtime as i64, "mtime: {name}");
+            assert_eq!(meta.uid(), uid, "uid: {name}");
+            assert_eq!(meta.gid(), gid, "gid: {name}");
+        }
+        assert_eq!(
+            std::fs::metadata(workspace.join("dir")).unwrap().mode() & 0o7777,
+            0o750
+        );
+        let file = std::fs::metadata(workspace.join("dir/file")).unwrap();
+        assert_eq!(file.mode() & 0o7777, 0o751);
+        assert_eq!(
+            file.ino(),
+            std::fs::metadata(workspace.join("dir/hard")).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("dir/file")).unwrap(),
+            b"contents\0\xff"
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join("dir/link")).unwrap(),
+            std::path::Path::new("file")
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join("dir/dangling")).unwrap(),
+            std::path::Path::new("missing")
+        );
+        assert_eq!(
+            std::fs::read(workspace.join(".wh.keep")).unwrap(),
+            b"ordinary file"
+        );
+        // Reproduce BusyBox's fresh symlink times even on hosts whose tar
+        // already preserves them, so this control exercises the repair itself.
+        for (name, target) in [("link", "file"), ("dangling", "missing")] {
+            let link = workspace.join("dir").join(name);
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+        super::restore_workspace_symlink_mtimes(&seed, &workspace).unwrap();
+        for name in ["link", "dangling"] {
+            assert_eq!(
+                std::fs::symlink_metadata(workspace.join("dir").join(name))
+                    .unwrap()
+                    .mtime(),
+                mtime as i64
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_symlink_timestamp_does_not_follow_external_target() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let target = fixture.path().join("outside");
+        std::fs::write(&target, b"unchanged").unwrap();
+        let original = std::fs::metadata(&target).unwrap();
+        let seed = fixture.path().join("workspace.tar");
+        let mut archive = tar::Builder::new(std::fs::File::create(&seed).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_uid(unsafe { libc::getuid() }.into());
+        header.set_gid(unsafe { libc::getgid() }.into());
+        header.set_mtime(0);
+        header.set_link_name(&target).unwrap();
+        archive
+            .append_data(&mut header, "external", std::io::empty())
+            .unwrap();
+        archive.finish().unwrap();
+        super::extract_workspace_seed(&seed, &workspace).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(workspace.join("external"))
+                .unwrap()
+                .mtime(),
+            0
+        );
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.mtime(), after.mtime_nsec()),
+            (original.mtime(), original.mtime_nsec())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
+
     #[test]
     fn cold_layout_is_bounded_by_manifest_and_available_disk() {
         use super::{cold_layout_fits, COLD_LAYOUT_FREE_RESERVE_BYTES, MAX_COLD_LAYOUT_BYTES};

@@ -32,6 +32,7 @@ for base in (Path('/opt/revision-fixture'), Path('/workspace/revision-fixture'))
         os.chmod(path, 0o750 if path == base else 0o640)
         os.utime(path, (1700000000, 1700000000))
     os.chmod(base / 'Case', 0o751)
+    os.utime(base / 'relative-link', (1700000000, 1700000000), follow_symlinks=False)
 os.sync()
 ```
 
@@ -89,3 +90,8 @@ The host uses a case-sensitive layer volume, while Linux can share `layers/`
 directly. The fix preserves the workspace archive intact on that guest-visible
 volume; the guest still performs the one-time workspace extraction. The reserved
 seed directory is never a rootfs layer, with or without a layer-order index.
+
+Workspace symlink timestamps require the rebuilt **guest agent**, not just a
+rebuilt host CLI. The agent retains its usual tar extraction, then restores link
+mtimes from the archive without following their targets. The agent-rootfs shipped
+in older distributions uses BusyBox tar alone and resets those timestamps.
