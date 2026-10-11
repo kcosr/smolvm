@@ -523,7 +523,6 @@ fn extract_workspace_seed(seed: &Path, workspace: &Path) -> Result<()> {
 }
 
 fn restore_workspace_symlink_mtimes(seed: &Path, workspace: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
     let root = workspace.canonicalize()?;
     let mut archive = tar::Archive::new(std::fs::File::open(seed)?);
     // Only headers are needed; seek past file contents instead of reading a
@@ -533,61 +532,74 @@ fn restore_workspace_symlink_mtimes(seed: &Path, workspace: &Path) -> Result<()>
         if !entry.header().entry_type().is_symlink() {
             continue;
         }
-        let path = entry.path()?;
-        if path.components().any(|part| {
-            !matches!(
-                part,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        }) {
-            return Err(StorageError::new("invalid workspace symlink path"));
+        let path = match entry.path() {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(%error, "workspace symlink path could not be read");
+                continue;
+            }
+        };
+        if let Err(error) = restore_workspace_symlink_mtime(&root, &path, entry.header()) {
+            warn!(%error, path = %path.display(), "workspace symlink timestamp could not be restored");
         }
-        let destination = root.join(path.as_ref());
-        let parent = destination
-            .parent()
-            .ok_or_else(|| StorageError::new("invalid workspace symlink path"))?
-            .canonicalize()?;
-        if !parent.starts_with(&root) {
-            return Err(StorageError::new(
-                "workspace symlink parent escapes workspace",
-            ));
-        }
-        // A later archive entry may have replaced the link with a regular file.
-        if !std::fs::symlink_metadata(&destination)?
-            .file_type()
-            .is_symlink()
-        {
-            continue;
-        }
-        let mtime = entry
-            .header()
-            .mtime()?
-            .try_into()
-            .map_err(|_| StorageError::new("workspace symlink timestamp out of range"))?;
-        let times = [
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_OMIT,
-            },
-            libc::timespec {
-                tv_sec: mtime,
-                tv_nsec: 0,
-            },
-        ];
-        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
-            .map_err(|_| StorageError::new("invalid workspace symlink path"))?;
-        // The no-follow flag applies even to dangling or absolute symlinks.
-        if unsafe {
-            libc::utimensat(
-                libc::AT_FDCWD,
-                destination.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    }
+    Ok(())
+}
+
+fn restore_workspace_symlink_mtime(root: &Path, path: &Path, header: &tar::Header) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(StorageError::new("invalid workspace symlink path"));
+    }
+    let destination = root.join(path);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| StorageError::new("invalid workspace symlink path"))?
+        .canonicalize()?;
+    if !parent.starts_with(&root) {
+        return Err(StorageError::new(
+            "workspace symlink parent escapes workspace",
+        ));
+    }
+    // A later archive entry may have replaced the link with a regular file.
+    if !std::fs::symlink_metadata(&destination)?
+        .file_type()
+        .is_symlink()
+    {
+        return Ok(());
+    }
+    let mtime = header
+        .mtime()?
+        .try_into()
+        .map_err(|_| StorageError::new("workspace symlink timestamp out of range"))?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: mtime,
+            tv_nsec: 0,
+        },
+    ];
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| StorageError::new("invalid workspace symlink path"))?;
+    // The no-follow flag applies even to dangling or absolute symlinks.
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
 }
@@ -6157,10 +6169,23 @@ mod tests {
         header.as_mut_bytes()[136..148].fill(0xff);
         header.set_cksum();
         archive.append(&header, std::io::empty()).unwrap();
+        header.set_path("later").unwrap();
+        header.set_mtime(946_684_800);
+        header.set_cksum();
+        archive.append(&header, std::io::empty()).unwrap();
         archive.finish().unwrap();
         super::extract_workspace_seed(&seed, &workspace).unwrap();
         assert!(workspace.join("link").is_symlink());
-        assert!(super::restore_workspace_symlink_mtimes(&seed, &workspace).is_err());
+        std::fs::remove_file(workspace.join("later")).unwrap();
+        std::os::unix::fs::symlink("missing", workspace.join("later")).unwrap();
+        super::restore_workspace_symlink_mtimes(&seed, &workspace).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::symlink_metadata(workspace.join("later"))
+                .unwrap()
+                .mtime(),
+            946_684_800
+        );
     }
 
     #[test]
