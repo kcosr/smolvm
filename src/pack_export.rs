@@ -953,6 +953,21 @@ mod cached_export_tests {
         assert_eq!(super::ordered_cached_layer_ids(cache.path()), None);
     }
 
+    #[test]
+    fn incomplete_imported_layer_is_never_exported() {
+        let cache = tempfile::tempdir().unwrap();
+        let layers = cache.path().join("layers");
+        std::fs::create_dir_all(layers.join("root.partial")).unwrap();
+        assert_eq!(super::ordered_cached_layer_ids(cache.path()), None);
+        std::fs::write(layers.join("root.tar"), b"complete archive").unwrap();
+        assert_eq!(
+            super::ordered_cached_layer_ids(cache.path()),
+            Some(vec!["layers/root.tar".into()])
+        );
+        std::fs::write(layers.join("layer-order"), "root.partial\n").unwrap();
+        assert_eq!(super::ordered_cached_layer_ids(cache.path()), None);
+    }
+
     use super::*;
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
@@ -1392,7 +1407,9 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
         // A workspace seed is a separate disk payload, never a rootfs layer.
         // Darwin stores its layer-order on the case-sensitive volume, so an
         // export commonly discovers staged tars without an index here.
-        if id == smolvm_pack::assets::WORKSPACE_SEED_DIR {
+        if id == smolvm_pack::assets::WORKSPACE_SEED_DIR
+            || smolvm_pack::extract::is_partial_dir_name(id)
+        {
             return None;
         }
         if layers_dir.join(id).is_dir() {
