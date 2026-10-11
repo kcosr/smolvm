@@ -2470,8 +2470,8 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // failure we return the error without claiming the machine
             // stopped and without detaching its volumes.
             cli_recover_if_unreachable(name)?;
-            // Process is gone — detach the layers volume so a non-running
-            // machine never holds a mount (invariant: mounted iff running).
+            // Process is gone — detach the layers volume unless fork children
+            // still reference it. Their pack links also pin a stopped source.
             // macOS hdiutil detach; a no-op on Linux.
             if record.source_smolmachine.is_some() {
                 smolvm_pack::extract::force_detach_layers_volume(
@@ -2546,8 +2546,8 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     }
 
     // Detach the machine's case-sensitive layers volume now that its process is
-    // gone (macOS hdiutil mount; no-op on Linux). The volume is owned 1:1 by this
-    // machine, so the detach is safe and re-acquired on the next start.
+    // gone (macOS hdiutil mount; no-op on Linux). A continuing source's volume
+    // stays mounted while child pack symlinks still reference it.
     if record.source_smolmachine.is_some() {
         smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
             name,
@@ -2642,7 +2642,7 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
         // Detach the per-machine layers volume now that the process is gone, so a
         // bundle-sourced default machine never holds a mount while stopped (macOS
         // hdiutil; no-op on Linux). Gated on the record so non-bundle machines are
-        // untouched; the volume is owned 1:1 by "default" and re-acquired on start.
+        // untouched; the volume belongs to "default" and its linked children.
         let is_bundle = config
             .get_vm("default")
             .map(|r| r.source_smolmachine.is_some())
@@ -2927,8 +2927,8 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // data dir below — otherwise the `rm -rf` fails with "Resource busy". The
     // lease was intentionally leaked with `std::mem::forget` at start time so the
     // volume stayed mounted while the VM ran. The volume lives under this
-    // machine's own data dir and is owned 1:1 by it, so the detach is
-    // unconditional and cannot affect any other machine.
+    // machine's own data dir. Dependent children block source deletion above;
+    // the detach helper also preserves any remaining child pack references.
     if record.source_smolmachine.is_some() {
         smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
             name,

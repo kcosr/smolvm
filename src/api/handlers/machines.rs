@@ -2930,11 +2930,10 @@ async fn create_machine_inner(
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
-    // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
+    // initially belongs only to this machine. Extraction mounts the volume on
     // macOS; detach it immediately so a created-but-unstarted machine leaves
-    // nothing mounted (invariant: the per-machine layers volume is mounted iff
-    // the VM is running). The name was reserved above, so this never clobbers
-    // another machine's layers.
+    // nothing mounted (it has no children yet). The name was reserved above,
+    // so this never clobbers another machine's layers.
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
@@ -5348,10 +5347,9 @@ pub async fn stop_machine(
     ) {
         // Not running. If a prior start mounted the layers volume but the VM
         // then failed to boot (or the server crashed while running), the volume
-        // could still be mounted — detach it so a stopped machine never holds a
-        // mount (invariant: the per-machine layers volume is mounted iff the VM
-        // is running). Safe: actual_state() probed liveness, so the process is
-        // confirmed dead and nothing is using the volume. macOS hdiutil detach;
+        // could still be mounted — detach it unless fork children reference it.
+        // actual_state() probed this process's liveness; the detach helper also
+        // checks child pack references before unmounting. macOS hdiutil detach;
         // a no-op on Linux.
         if record.source_smolmachine.is_some() {
             let name_clone = name.clone();
@@ -5433,8 +5431,8 @@ pub async fn stop_machine(
         if outcome.is_ok() {
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux). The volume lives
-            // under the machine's own data dir and is owned 1:1 by it, so the
-            // detach is unconditional and re-acquired on the next start.
+            // under the machine's data dir. The detach helper preserves it if
+            // a continuing source still has children referencing its layers.
             smolvm_pack::extract::force_detach_layers_volume(
                 &crate::agent::machine_layers_cache_dir(&name_clone),
             );
@@ -5866,7 +5864,8 @@ async fn delete_one_transaction(
             // Process is gone — detach this machine's case-sensitive layers
             // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
             // removed below, otherwise `rm -rf` fails with "Resource busy". The
-            // volume is owned 1:1 by this machine, so the detach is unconditional.
+            // dependent children were checked above; the detach helper also
+            // preserves any remaining child pack references.
             smolvm_pack::extract::force_detach_layers_volume(
                 &crate::agent::machine_layers_cache_dir(&name_clone),
             );
