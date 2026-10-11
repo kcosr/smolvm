@@ -934,6 +934,25 @@ fn cached_export_image(
 
 #[cfg(test)]
 mod cached_export_tests {
+    #[test]
+    fn imported_workspace_seed_is_not_an_export_layer() {
+        let cache = tempfile::tempdir().unwrap();
+        let layers = cache.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::write(layers.join("workspace-seed/workspace.tar"), b"seed").unwrap();
+        // Darwin's order index is on the mounted case-sensitive volume; the
+        // staging directory still holds the tar plus the reserved seed dir.
+        std::fs::write(layers.join("root.tar"), b"layer").unwrap();
+        assert_eq!(
+            super::ordered_cached_layer_ids(cache.path()),
+            Some(vec!["layers/root.tar".into()])
+        );
+        std::fs::remove_file(layers.join("root.tar")).unwrap();
+        assert_eq!(super::ordered_cached_layer_ids(cache.path()), None);
+        std::fs::write(layers.join("layer-order"), "workspace-seed\n").unwrap();
+        assert_eq!(super::ordered_cached_layer_ids(cache.path()), None);
+    }
+
     use super::*;
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
@@ -1370,6 +1389,12 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
     let order_path = layers_dir.join("layer-order");
     let cached_form = |id: &str| -> Option<String> {
+        // A workspace seed is a separate disk payload, never a rootfs layer.
+        // Darwin stores its layer-order on the case-sensitive volume, so an
+        // export commonly discovers staged tars without an index here.
+        if id == smolvm_pack::assets::WORKSPACE_SEED_DIR {
+            return None;
+        }
         if layers_dir.join(id).is_dir() {
             Some(format!("layers/{}", id))
         } else if layers_dir.join(format!("{id}.tar")).is_file() {
