@@ -514,14 +514,21 @@ pub fn seed_workspace_from_pack() {
 /// the archive without following link targets.
 fn extract_workspace_seed(seed: &Path, workspace: &Path) -> Result<()> {
     extract_layer_tar(seed, workspace)?;
-    restore_workspace_symlink_mtimes(seed, workspace)
+    if let Err(error) = restore_workspace_symlink_mtimes(seed, workspace) {
+        // Contents are already restored. Do not suppress the seeded marker:
+        // retrying extraction on a later boot could overwrite the user's edits.
+        warn!(%error, "workspace restored, but some symlink timestamps could not be restored");
+    }
+    Ok(())
 }
 
 fn restore_workspace_symlink_mtimes(seed: &Path, workspace: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let root = workspace.canonicalize()?;
     let mut archive = tar::Archive::new(std::fs::File::open(seed)?);
-    for entry in archive.entries()? {
+    // Only headers are needed; seek past file contents instead of reading a
+    // potentially large workspace archive for a second time.
+    for entry in archive.entries_with_seek()? {
         let entry = entry?;
         if !entry.header().entry_type().is_symlink() {
             continue;
@@ -6023,7 +6030,14 @@ mod tests {
             if !target.is_empty() {
                 header.set_link_name(target).unwrap();
             }
-            archive.append_data(&mut header, name, bytes).unwrap();
+            // Production seeds come from `tar -C workspace .`, including './'.
+            header.set_path(format!("./{name}")).unwrap();
+            // Preserve the prefix even if the builder normalizes paths.
+            let prefixed = format!("./{name}");
+            header.as_mut_bytes()[..100].fill(0);
+            header.as_mut_bytes()[..prefixed.len()].copy_from_slice(prefixed.as_bytes());
+            header.set_cksum();
+            archive.append(&header, bytes).unwrap();
         }
         archive.finish().unwrap();
         super::extract_workspace_seed(&seed, &workspace).unwrap();
@@ -6120,6 +6134,33 @@ mod tests {
             (original.mtime(), original.mtime_nsec())
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn workspace_timestamp_repair_error_does_not_fail_successful_extraction() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let seed = fixture.path().join("workspace.tar");
+        let mut archive = tar::Builder::new(std::fs::File::create(&seed).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("link").unwrap();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_uid(unsafe { libc::getuid() }.into());
+        header.set_gid(unsafe { libc::getgid() }.into());
+        header.set_link_name("missing").unwrap();
+        // GNU base-256 mtime -1: tar can extract it, but the Rust header's
+        // unsigned mtime accessor cannot represent it. This must not suppress
+        // the caller's seeded marker and cause re-extraction on every boot.
+        header.as_mut_bytes()[136..148].fill(0xff);
+        header.set_cksum();
+        archive.append(&header, std::io::empty()).unwrap();
+        archive.finish().unwrap();
+        super::extract_workspace_seed(&seed, &workspace).unwrap();
+        assert!(workspace.join("link").is_symlink());
+        assert!(super::restore_workspace_symlink_mtimes(&seed, &workspace).is_err());
     }
 
     #[test]
