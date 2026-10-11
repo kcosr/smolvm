@@ -1693,13 +1693,13 @@ fn start_vm_named_with_db(
             cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
-            let clones = db.dependent_clones(name).unwrap_or_default();
+            let clones = smolvm::agent::fork::restart_blocking_dependent_clones(&db, name)?;
             let reason = if clones.is_empty() {
                 "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                     .to_string()
             } else {
                 format!(
-                    "it is the branch source for {} live child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
+                    "it is the frozen branch source for {} dependent child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
                     clones.len(),
                     clones.join(", ")
                 )
@@ -2485,15 +2485,16 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         RecordState::Frozen => {
-            let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
+            let clones =
+                smolvm::agent::fork::restart_blocking_dependent_clones(&SmolvmDb::open()?, name)?;
             if !clones.is_empty() {
                 // A snapshot-frozen fork base must outlive its clones: their
                 // disks CoW-back onto its disks and their RAM maps its memfd.
                 return Err(smolvm::Error::agent(
                     "stop",
                     format!(
-                        "machine '{name}' is the fork base for {} live clone(s) ({}); \
-                         stop or delete the clones first",
+                        "machine '{name}' is the fork base for {} dependent clone(s) ({}); \
+                         delete those clones first",
                         clones.len(),
                         clones.join(", ")
                     ),

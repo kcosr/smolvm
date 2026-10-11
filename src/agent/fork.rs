@@ -668,7 +668,7 @@ pub(crate) fn retained_snapshot_source_continues(snapshot: &RetainedForkSnapshot
     snapshot.path.join("source-continues-v1").is_file()
 }
 
-fn restart_blocking_dependent_clones_in(
+pub(super) fn restart_blocking_dependent_clones_in(
     db: &SmolvmDb,
     golden: &str,
     snapshot_root: &Path,
