@@ -397,8 +397,9 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// this lives *under* the machine's own [`vm_data_dir`], which means:
 /// - it is reclaimed for free when the data dir is removed on delete;
 /// - it is outside `pack prune`'s scope (never reaped while the machine exists);
-/// - the macOS case-sensitive layers volume is owned 1:1 by the machine, so the
-///   stop/delete paths can detach it unconditionally with no co-tenant risk.
+/// - the macOS case-sensitive volume is owned by this machine and any fork
+///   children linking to it. Stop/delete detach it once those references are
+///   removed; standalone process-lease orphan sweeping never reclaims it.
 ///
 /// The subdir is `pack` (deliberately not `layers`) so it cannot collide with
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
@@ -1813,10 +1814,11 @@ impl AgentManager {
             return Ok(());
         }
         // This runs only on the relaunch path, after stop()/reset_stale_running_state,
-        // so no live VM is using the volume. The original start leaked a lease to keep
-        // it mounted; drop that stale mount (and its lease files) before acquiring a
-        // fresh one, so a config-change restart doesn't stack a second lease/mount on
-        // the first. Gated by the same conditions as the re-acquire below, so the
+        // so this VM is no longer using the volume. The original start leaked a lease
+        // to keep it mounted; drop that stale mount before acquiring a fresh one.
+        // force_detach preserves the mount if fork children still reference it; the
+        // acquisition then reuses it without disturbing their host handles.
+        // Gated by the same conditions as the re-acquire below, so the
         // explicit-start paths (features already `Some`, mount still live) return
         // early above and never detach. macOS hdiutil detach; a no-op on Linux.
         smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
