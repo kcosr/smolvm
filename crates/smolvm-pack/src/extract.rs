@@ -3,6 +3,7 @@
 //! Provides shared extraction logic used by both the main `smolvm` binary
 //! (sidecar mode via `runpack`) and the standalone stub executable.
 
+use crate::assets::{WORKSPACE_SEED_DIR, WORKSPACE_SEED_FILE};
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use ring::digest::{Context, SHA256};
 use std::fmt::Write as _;
@@ -1631,8 +1632,10 @@ pub fn sync_extracted_memory(cache_dir: &Path) -> std::io::Result<()> {
 /// that would repair it. Callers that need the layers should require BOTH.
 pub fn cached_layers_usable(cache_dir: &Path) -> bool {
     let layers_dir = cache_dir.join("layers");
-    let has_form =
-        |id: &str| layers_dir.join(id).is_dir() || layers_dir.join(format!("{id}.tar")).is_file();
+    let has_form = |id: &str| {
+        id != WORKSPACE_SEED_DIR
+            && (layers_dir.join(id).is_dir() || layers_dir.join(format!("{id}.tar")).is_file())
+    };
     if let Ok(contents) = fs::read_to_string(layers_dir.join("layer-order")) {
         let ids: Vec<&str> = contents
             .lines()
@@ -1646,7 +1649,8 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
             rd.flatten().any(|e| {
                 let path = e.path();
                 let staging = e.file_name().to_str().is_some_and(is_partial_dir_name);
-                (path.is_dir() && !staging) || path.extension().is_some_and(|x| x == "tar")
+                (path.is_dir() && !staging && e.file_name() != WORKSPACE_SEED_DIR)
+                    || path.extension().is_some_and(|x| x == "tar")
             })
         })
         .unwrap_or(false)
@@ -3962,6 +3966,44 @@ fn layer_id_from_asset_path(path: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Keep the workspace tar beside the layers the guest actually mounts. macOS
+/// host extraction uses a separate case-sensitive volume; copying only the OCI
+/// layers there leaves the seed invisible. Do not unpack the workspace on the
+/// host: the guest restores its ownership/links and seeds a fresh disk only once.
+fn expose_workspace_seed(layers_dir: &Path, extract_dir: &Path) -> std::io::Result<()> {
+    let source_dir = layers_dir.join(WORKSPACE_SEED_DIR);
+    match fs::symlink_metadata(&source_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(meta) if meta.is_dir() => {}
+        Err(e) => return Err(e),
+        _ => return Err(std::io::Error::other("workspace seed must be a directory")),
+    }
+    let source = source_dir.join(WORKSPACE_SEED_FILE);
+    let meta = fs::symlink_metadata(&source)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(
+            "workspace seed must be a regular archive",
+        ));
+    }
+    if layers_dir == extract_dir {
+        return Ok(());
+    }
+    preflight_free_space(extract_dir, meta.len(), "the packed workspace seed")?;
+    let destination_dir = extract_dir.join(WORKSPACE_SEED_DIR);
+    match fs::create_dir(&destination_dir) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&destination_dir)?.is_dir() => {}
+        Err(e) => return Err(e),
+    }
+    // Publish only a complete copy, so an interrupted extraction can retry.
+    let temporary = tempfile::NamedTempFile::new_in(&destination_dir)?;
+    fs::copy(source, temporary.path())?;
+    temporary.persist(destination_dir.join(WORKSPACE_SEED_FILE))?;
+    Ok(())
+}
+
 /// Post-process extracted assets: unpack agent rootfs, OCI layers, fix
 /// permissions, and (when `layer_order` is non-empty) write the layer-order
 /// index so the guest stacks the layers in true OCI order rather than by their
@@ -4060,6 +4102,8 @@ fn post_process_extraction(
                 }
             }
         }
+
+        expose_workspace_seed(&layers_dir, &extract_dir)?;
 
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
@@ -4365,18 +4409,23 @@ fn has_layer_tars(cache_dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// Sum the sizes of all `.tar` files in a directory.
+/// Sum layer tars and the workspace archive that also lives on the volume.
 #[cfg(target_os = "macos")]
 fn sum_tar_sizes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
-    entries
+    let layers: u64 = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "tar"))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
-        .sum()
+        .sum();
+    layers.saturating_add(
+        fs::metadata(dir.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE))
+            .map(|m| m.len())
+            .unwrap_or(0),
+    )
 }
 
 /// Check whether `path` is a mount point by comparing device IDs with parent.
@@ -7551,6 +7600,124 @@ mod tests {
             result.is_err(),
             "case collision should fail on case-insensitive FS"
         );
+    }
+
+    #[test]
+    fn workspace_seed_alone_is_not_a_cached_image_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        fs::write(layers.join("workspace-seed/workspace.tar"), b"seed").unwrap();
+        assert!(!cached_layers_usable(temp.path()));
+        fs::write(layers.join("layer-order"), "workspace-seed\n").unwrap();
+        assert!(!cached_layers_usable(temp.path()));
+        fs::create_dir(layers.join("real-layer")).unwrap();
+        fs::write(layers.join("layer-order"), "real-layer\n").unwrap();
+        assert!(cached_layers_usable(temp.path()));
+    }
+
+    #[test]
+    fn workspace_seed_copy_preserves_archive_and_supports_retry_or_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("layers");
+        let target = temp.path().join("mounted-layers");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        expose_workspace_seed(&source, &target).unwrap();
+        assert!(!target.join(WORKSPACE_SEED_DIR).exists());
+        fs::create_dir(source.join(WORKSPACE_SEED_DIR)).unwrap();
+        let seed = source.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE);
+        let bytes = b"opaque archive\0\xff\x80";
+        fs::write(&seed, bytes).unwrap();
+        expose_workspace_seed(&source, &source).unwrap();
+        expose_workspace_seed(&source, &target).unwrap();
+        let copy = target.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE);
+        assert_eq!(fs::read(&copy).unwrap(), bytes);
+        fs::write(&copy, b"partial earlier copy").unwrap();
+        expose_workspace_seed(&source, &target).unwrap();
+        assert_eq!(fs::read(&copy).unwrap(), bytes);
+        assert_eq!(fs::read(&seed).unwrap(), bytes);
+        assert_eq!(fs::read_dir(copy.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_seed_copy_rejects_symlinked_source_and_destination() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("layers");
+        let target = temp.path().join("mounted-layers");
+        let outside = temp.path().join("outside");
+        for dir in [&source, &target, &outside] {
+            fs::create_dir(dir).unwrap();
+        }
+        symlink(&outside, source.join(WORKSPACE_SEED_DIR)).unwrap();
+        assert!(expose_workspace_seed(&source, &target).is_err());
+        fs::remove_file(source.join(WORKSPACE_SEED_DIR)).unwrap();
+        fs::create_dir(source.join(WORKSPACE_SEED_DIR)).unwrap();
+        let seed = source.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE);
+        let external = outside.join(WORKSPACE_SEED_FILE);
+        fs::write(&external, b"untouched").unwrap();
+        symlink(&external, &seed).unwrap();
+        assert!(expose_workspace_seed(&source, &target).is_err());
+        fs::remove_file(&seed).unwrap();
+        fs::write(&seed, b"seed").unwrap();
+        symlink(&outside, target.join(WORKSPACE_SEED_DIR)).unwrap();
+        assert!(expose_workspace_seed(&source, &target).is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"untouched");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn layer_volume_size_includes_workspace_seed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("image.tar"), b"root").unwrap();
+        fs::create_dir(temp.path().join(WORKSPACE_SEED_DIR)).unwrap();
+        fs::write(
+            temp.path()
+                .join(WORKSPACE_SEED_DIR)
+                .join(WORKSPACE_SEED_FILE),
+            b"workspace",
+        )
+        .unwrap();
+        assert_eq!(sum_tar_sizes(temp.path()), 13);
+    }
+
+    /// Requires hdiutil; deliberately does not silently skip a failed mount.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates a private case-sensitive APFS image with hdiutil"]
+    fn macos_workspace_seed_is_in_guest_visible_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().canonicalize().unwrap();
+        let layers = cache.join("layers");
+        fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        let seed = b"workspace archive bytes\0\xff";
+        fs::write(layers.join("workspace-seed/workspace.tar"), seed).unwrap();
+        fs::write(
+            layers.join("image.tar"),
+            build_tar(&[("file", false, b"root")]),
+        )
+        .unwrap();
+        let result = (|| {
+            post_process_extraction(&cache, &["image".into()], false, false, true)?;
+            let lease = acquire_layers_lease(&cache, false)?;
+            assert_ne!(lease.path, layers);
+            assert!(is_mount_point(&lease.path));
+            assert_eq!(
+                fs::read(lease.path.join("workspace-seed/workspace.tar"))?,
+                seed
+            );
+            assert_eq!(
+                fs::read_to_string(lease.path.join(LAYER_ORDER_FILE))?,
+                "image"
+            );
+            assert_eq!(fs::read(layers.join("workspace-seed/workspace.tar"))?, seed);
+            Ok::<_, std::io::Error>(())
+        })();
+        force_detach_layers_volume(&cache);
+        assert!(!is_mount_point(&cache.join(CS_MOUNT_DIR)));
+        result.unwrap();
     }
 
     /// Staged tars (in-guest extraction mode) must be shared from the plain

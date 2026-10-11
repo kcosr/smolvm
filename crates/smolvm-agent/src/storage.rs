@@ -1189,7 +1189,8 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
             // A `.partial` directory is an extraction the host had not finished
             // (it renames a complete one into its layer name); it is never a
             // layer, whatever it happens to contain.
-            if !name.ends_with(".tar")
+            if name != "workspace-seed"
+                && !name.ends_with(".tar")
                 && !name.ends_with(".partial")
                 && !is_volume_metadata(&entry.file_name())
             {
@@ -7274,6 +7275,25 @@ mod tests {
         }
         let ordered = ordered_packed_layer_names(dir.path()).unwrap();
         assert_eq!(ordered, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[test]
+    fn ordered_packed_layers_exclude_workspace_seed_with_or_without_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("workspace-seed")).unwrap();
+        std::fs::write(dir.path().join("workspace-seed/workspace.tar"), b"seed").unwrap();
+        assert!(ordered_packed_layer_names(dir.path()).is_err());
+        std::fs::create_dir(dir.path().join("image")).unwrap();
+        assert_eq!(
+            ordered_packed_layer_names(dir.path()).unwrap(),
+            vec!["image"]
+        );
+        std::fs::write(dir.path().join(LAYER_ORDER_FILE), "workspace-seed\nimage\n").unwrap();
+        assert_eq!(
+            ordered_packed_layer_names(dir.path()).unwrap(),
+            vec!["image"]
+        );
+        assert!(staged_layer_tars(dir.path()).unwrap().is_empty());
     }
 
     #[test]
