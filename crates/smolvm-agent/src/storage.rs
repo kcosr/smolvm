@@ -34,6 +34,9 @@ const MANIFESTS_DIR: &str = "manifests";
 const IMAGE_METADATA_DIR: &str = "image-metadata";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
+// Packed artifact contract; keep aligned with smolvm_pack::assets.
+const WORKSPACE_SEED_DIR: &str = "workspace-seed";
+const WORKSPACE_SEED_FILE: &str = "workspace.tar";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 /// Username Docker uses when the secret is an OAuth identity token.
@@ -478,13 +481,11 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 /// first boot only, and later boots leave whatever the user has done since.
 /// Absent seed, or any failure, leaves the workspace as it was.
 pub fn seed_workspace_from_pack() {
-    const SEED_DIR: &str = "workspace-seed";
-    const SEED_FILE: &str = "workspace.tar";
     const MARKER: &str = ".smolvm-workspace-seeded";
     let Some(packed) = get_packed_layers_dir() else {
         return;
     };
-    let seed = packed.join(SEED_DIR).join(SEED_FILE);
+    let seed = packed.join(WORKSPACE_SEED_DIR).join(WORKSPACE_SEED_FILE);
     if !seed.is_file() {
         return;
     }
@@ -1189,7 +1190,7 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
             // A `.partial` directory is an extraction the host had not finished
             // (it renames a complete one into its layer name); it is never a
             // layer, whatever it happens to contain.
-            if name != "workspace-seed"
+            if name != WORKSPACE_SEED_DIR
                 && !name.ends_with(".tar")
                 && !name.ends_with(".partial")
                 && !is_volume_metadata(&entry.file_name())

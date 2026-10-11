@@ -1630,6 +1630,8 @@ pub fn sync_extracted_memory(cache_dir: &Path) -> std::io::Result<()> {
 /// files but leaves the tiny marker produces a cache that passes `is_extracted`
 /// yet can neither boot nor export, and the marker then blocks the re-extract
 /// that would repair it. Callers that need the layers should require BOTH.
+/// The index must contain only image layers: a reserved workspace-seed entry is
+/// invalid even alongside real layers. Re-extraction rewrites it from the manifest.
 pub fn cached_layers_usable(cache_dir: &Path) -> bool {
     let layers_dir = cache_dir.join("layers");
     let has_form = |id: &str| {
@@ -3998,6 +4000,8 @@ fn expose_workspace_seed(layers_dir: &Path, extract_dir: &Path) -> std::io::Resu
         Err(e) => return Err(e),
     }
     // Publish only a complete copy, so an interrupted extraction can retry.
+    // A hard kill can leave a temporary file until this cache is removed. The
+    // guest ignores it; do not sweep files that another extraction may be using.
     let temporary = tempfile::NamedTempFile::new_in(&destination_dir)?;
     fs::copy(source, temporary.path())?;
     temporary.persist(destination_dir.join(WORKSPACE_SEED_FILE))?;
@@ -7612,6 +7616,8 @@ mod tests {
         fs::write(layers.join("layer-order"), "workspace-seed\n").unwrap();
         assert!(!cached_layers_usable(temp.path()));
         fs::create_dir(layers.join("real-layer")).unwrap();
+        fs::write(layers.join("layer-order"), "real-layer\nworkspace-seed\n").unwrap();
+        assert!(!cached_layers_usable(temp.path()));
         fs::write(layers.join("layer-order"), "real-layer\n").unwrap();
         assert!(cached_layers_usable(temp.path()));
     }
