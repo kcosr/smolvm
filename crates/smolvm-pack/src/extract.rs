@@ -4351,6 +4351,9 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
 /// Used by `--force-extract` before clearing the cache. NOT used by normal
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
+/// A named machine's volume is also shared by its fork children. Their pack
+/// symlinks pin it until the children are deleted, even if the source stops.
+/// Once those references are gone, stopping/deleting the source reclaims it.
 pub fn force_detach_layers_volume(cache_dir: &Path) {
     // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
     // own the volume or the leases behind it, so detaching through the link
@@ -4366,6 +4369,19 @@ pub fn force_detach_layers_volume(cache_dir: &Path) {
     {
         let mount_point = cache_dir.join(CS_MOUNT_DIR);
         if mount_point.exists() && is_mount_point(&mount_point) {
+            match machine_layers_have_dependents(cache_dir) {
+                Ok(true) => return,
+                Err(error) => {
+                    // An unreadable ownership inventory is not permission to
+                    // tear a filesystem out from under a possible live child.
+                    eprintln!(
+                        "warning: retaining layers volume {}: {error}",
+                        cache_dir.display()
+                    );
+                    return;
+                }
+                Ok(false) => {}
+            }
             let _ = std::process::Command::new("hdiutil")
                 .args(["detach", "-quiet", "-force"])
                 .arg(&mount_point)
@@ -4543,20 +4559,63 @@ fn detach_if_unused(cache_dir: &Path) {
     }
 }
 
-/// The sibling cache directories that may hold a stranded volume.
-///
-/// Two layouts use this protocol: `<root>/<hash>` (standalone packs) and
-/// `<root>/<hash>/pack` (VM-backed packs). Both are handled by walking up to the
-/// directory that *contains the hashes* and re-applying our own suffix, so we
-/// only ever look at peers of the same shape.
-#[cfg(target_os = "macos")]
+/// Named machines use `<vm-root>/<hash>/pack`; standalone packs use
+/// `<pack-root>/<checksum>`. Named volumes outlive the process that mounts them
+/// and are reclaimed by machine stop/delete, never by process-lease GC.
+#[cfg(any(target_os = "macos", test))]
+fn is_machine_layers_cache(cache_dir: &Path) -> bool {
+    cache_dir.file_name().is_some_and(|name| name == "pack")
+}
+
+/// Fork children link their pack directory to the source (possibly through
+/// another child). Keep that immutable volume while any such reference exists.
+/// This deliberately includes stopped children: they may cold-start later, and
+/// a continuing source can stop/restart without invalidating their host handles.
+/// No PID lease or single overwriteable daemon owner can express that lifetime.
+#[cfg(any(target_os = "macos", test))]
+fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
+    if !is_machine_layers_cache(cache_dir) {
+        return Ok(false);
+    }
+    let Some(root) = cache_dir.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let source = fs::canonicalize(cache_dir)?;
+    for entry in fs::read_dir(root)? {
+        let peer = entry?.path().join("pack");
+        let metadata = match peer.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            match fs::canonicalize(&peer) {
+                Ok(target) if target == source => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Standalone sibling caches that may hold a stranded process-owned volume.
+/// The start CLI's exit says nothing about a named VMM's liveness. In particular,
+/// walking `<vm-root>/<hash>/pack` peers would detach running sibling machines.
+#[cfg(any(target_os = "macos", test))]
 fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
-    let nested = cache_dir.file_name().is_some_and(|n| n == "pack");
-    let Some(root) = (if nested {
-        cache_dir.parent().and_then(Path::parent)
-    } else {
-        cache_dir.parent()
-    }) else {
+    if is_machine_layers_cache(cache_dir) {
+        return Vec::new();
+    }
+    let Some(root) = cache_dir.parent() else {
         return Vec::new();
     };
     let Ok(entries) = fs::read_dir(root) else {
@@ -4564,14 +4623,8 @@ fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .filter_map(|e| e.ok())
-        .map(|e| {
-            if nested {
-                e.path().join("pack")
-            } else {
-                e.path()
-            }
-        })
-        .filter(|p| p != cache_dir && p.is_dir())
+        .map(|e| e.path())
+        .filter(|p| p != cache_dir && p.is_dir() && !p.is_symlink())
         .collect()
 }
 
@@ -8382,8 +8435,8 @@ mod tests {
     }
 }
 
-/// Reaping stranded case-sensitive volumes (macOS-only lease protocol).
-#[cfg(all(test, target_os = "macos"))]
+/// Ownership selection is portable; actual volume operations are macOS-only.
+#[cfg(all(test, unix))]
 mod orphan_reap_tests {
     use super::*;
 
@@ -8403,10 +8456,10 @@ mod orphan_reap_tests {
         assert!(!peers.contains(&root.join("aaa")));
     }
 
-    /// VM-backed packs live at `<root>/<hash>/pack` — a peer is another hash's
-    /// `pack` subdir, not the hash directory itself.
+    /// Named machines outlive the CLI that acquired their layers. Its dead PID
+    /// is not evidence that a sibling machine's volume can be detached.
     #[test]
-    fn nested_layout_keeps_the_pack_suffix() {
+    fn machine_layout_is_not_subject_to_process_orphan_reaping() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         for h in ["aaa", "bbb"] {
@@ -8414,7 +8467,7 @@ mod orphan_reap_tests {
         }
         let peers = sibling_cache_dirs(&root.join("aaa").join("pack"));
 
-        assert_eq!(peers, vec![root.join("bbb").join("pack")]);
+        assert!(peers.is_empty());
     }
 
     /// A hash directory with no `pack` subdir is simply skipped, rather than
@@ -8429,9 +8482,66 @@ mod orphan_reap_tests {
         assert!(sibling_cache_dirs(&root.join("aaa").join("pack")).is_empty());
     }
 
+    #[test]
+    fn standalone_reaper_does_not_follow_cache_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("aaa")).unwrap();
+        fs::create_dir(root.join("bbb")).unwrap();
+        std::os::unix::fs::symlink(root.join("bbb"), root.join("alias")).unwrap();
+        assert_eq!(
+            sibling_cache_dirs(&root.join("aaa")),
+            vec![root.join("bbb")]
+        );
+    }
+
+    #[test]
+    fn machine_references_include_relative_and_transitive_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("unrelated/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        fs::create_dir(root.join("grandchild")).unwrap();
+        std::os::unix::fs::symlink("../child/pack", root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("child/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn unrelated_and_dangling_references_do_not_pin_a_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        for name in ["source/pack", "other/pack", "child", "dangling"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink("../other/pack", root.join("child/pack")).unwrap();
+        std::os::unix::fs::symlink("../missing/pack", root.join("dangling/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn unreadable_reference_inventory_is_not_classified_as_unused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("loop")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("loop/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).is_err());
+    }
+
     /// The reaper must never block: a peer mid-acquire holds its lock, and
     /// waiting on it would stall an unrelated artifact's run.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_held_lock_is_skipped_not_waited_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
@@ -8449,6 +8559,7 @@ mod orphan_reap_tests {
     /// Reaping is a no-op when nothing is mounted — the common case, and it must
     /// not disturb a peer's directory contents.
     #[test]
+    #[cfg(target_os = "macos")]
     fn unmounted_peers_are_left_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -8461,6 +8572,81 @@ mod orphan_reap_tests {
         reap_orphan_volumes(&root.join("aaa"));
 
         assert!(peer.exists(), "peer directory must survive");
+    }
+
+    /// Real hdiutil control: dead standalone leases are reclaimed, while the
+    /// same dead CLI lease in a named-machine layout must not be reclaimed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates disposable APFS sparse images with hdiutil"]
+    fn native_orphan_sweep_respects_machine_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let machine = root.join("vms/aaa/pack");
+        let peer = root.join("vms/bbb/pack");
+        let standalone = root.join("packs/aaa");
+        let standalone_peer = root.join("packs/bbb");
+        let paths = [&machine, &peer, &standalone, &standalone_peer];
+        for path in paths {
+            fs::create_dir_all(path.join(LEASES_DIR)).unwrap();
+        }
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    force_detach_layers_volume(path);
+                }
+            }
+        }
+        let _cleanup = Cleanup(paths.iter().map(|p| p.to_path_buf()).collect());
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let exited_pid = child.id();
+        child.wait().unwrap();
+        for path in [&machine, &standalone] {
+            ensure_cs_volume_mounted(path, false).unwrap();
+            fs::write(path.join(LEASES_DIR).join(exited_pid.to_string()), "").unwrap();
+        }
+        ensure_cs_volume_mounted(&peer, false).unwrap();
+        let lease = acquire_layers_lease(&peer, false).unwrap();
+        assert!(is_mount_point(&lease.path));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        reap_orphan_volumes(&standalone_peer);
+        assert!(!is_mount_point(&standalone.join(CS_MOUNT_DIR)));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        drop(lease);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates a disposable APFS sparse image with hdiutil"]
+    fn native_source_volume_is_pinned_by_child_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source/pack");
+        let child = root.join("child/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.1);
+                force_detach_layers_volume(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(source.clone(), child.clone());
+        ensure_cs_volume_mounted(&source, false).unwrap();
+        fs::write(source.join(CS_MOUNT_DIR).join("marker"), "source").unwrap();
+        std::os::unix::fs::symlink(&source, &child).unwrap();
+        force_detach_layers_volume(&source);
+        force_detach_layers_volume(&child);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        assert_eq!(
+            fs::read_to_string(child.join(CS_MOUNT_DIR).join("marker")).unwrap(),
+            "source"
+        );
+        fs::remove_file(&child).unwrap();
+        force_detach_layers_volume(&source);
+        assert!(!is_mount_point(&source.join(CS_MOUNT_DIR)));
     }
 }
 
