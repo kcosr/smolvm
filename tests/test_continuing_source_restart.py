@@ -7,7 +7,7 @@ Requires a branch-capable Linux or macOS runtime with its normal guest assets.
 Set SMOLVM_TEST_IMAGE to a local OCI archive to also cover container workloads;
 otherwise uses the bundled bare guest. No networking or host mounts are used.
 All machines live in a disposable account registry, removed only after successful
-named cleanup. Failures retain that directory for stock CLI recovery.
+named cleanup. Cleanup failures retain that directory for stock CLI recovery.
 """
 
 import json
@@ -125,6 +125,28 @@ class ContinuingSourceRestart(unittest.TestCase):
         # A new branch must capture the restarted source, not its old snapshot.
         self.branch("new-child")
         self.assertEqual(self.execute("new-child", "cat /workspace/value"), "parent")
+
+    def test_mixed_generations_only_block_on_frozen_children(self):
+        self.create("source")
+        self.execute("source", "printf original > /workspace/value")
+        self.branch("continuing-child")
+        self.run_vm("machine", "stop", "--name", "source")
+        self.start("source")
+        self.execute("source", "printf later > /workspace/value")
+        self.branch("frozen-child", freeze=True)
+        for action in ["start", "stop"]:
+            result = self.run_vm("machine", action, "--name", "source", success=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("frozen-child", result.stderr)
+            self.assertNotIn("continuing-child", result.stderr)
+        self.run_vm("machine", "stop", "--name", "frozen-child")
+        self.run_vm("machine", "delete", "--name", "frozen-child", "--force")
+        self.machines.remove("frozen-child")
+        self.run_vm("machine", "stop", "--name", "source")
+        self.start("source")
+        self.assert_state("source", "running")
+        self.assertEqual(self.execute("source", "cat /workspace/value"), "later")
+        self.assertEqual(self.execute("continuing-child", "cat /workspace/value"), "original")
 
     def test_explicit_frozen_source_remains_protected(self):
         self.create("source")
