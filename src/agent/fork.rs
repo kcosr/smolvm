@@ -1826,6 +1826,10 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
     if record.is_none() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = release_shared_layers_after_child_delete(db, parent) {
+        tracing::warn!(%parent, %error, "could not release shared layers volume");
+    }
     let snapshot_root = vm_data_dir(parent).join("s");
     let retained = db.retained_fork_snapshot(parent)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1854,6 +1858,36 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
 #[doc(hidden)]
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn collect_parent_generations_after_child_delete(_db: &SmolvmDb, _parent: &str) -> Result<()> {
+    Ok(())
+}
+
+/// A deleted child linked its `pack` dir to the macOS layers volume of the
+/// machine at the root of its fork chain. Stopping that machine kept the volume
+/// mounted for its children, so once the last one is gone and the owner is not
+/// running, nothing else would unmount it until the owner's next stop/delete.
+#[cfg(target_os = "macos")]
+fn release_shared_layers_after_child_delete(db: &SmolvmDb, parent: &str) -> Result<()> {
+    let mut owner = parent.to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(owner.clone()) {
+        let Some(record) = db.get_vm(&owner)? else {
+            return Ok(());
+        };
+        let layers = crate::agent::machine_layers_cache_dir(&owner);
+        let linked = layers
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if !linked {
+            if record.source_smolmachine.is_some() && !record.is_process_alive() {
+                smolvm_pack::extract::release_unused_machine_layers_volume(&layers);
+            }
+            return Ok(());
+        }
+        let Some(golden) = record.golden else {
+            return Ok(());
+        };
+        owner = golden;
+    }
     Ok(())
 }
 

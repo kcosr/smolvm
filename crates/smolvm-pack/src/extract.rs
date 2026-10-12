@@ -4298,14 +4298,45 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
     }
 }
 
+/// Detach a stopped named machine's layers volume once its last fork child is
+/// gone. The caller has checked that the owning VMM is not alive; this keeps
+/// the volume when a live process holds a lease (a start is mid-launch) or a
+/// child still links to it. Holding the lease lock across the check and the
+/// detach keeps a concurrent acquire from mounting in between.
+pub fn release_unused_machine_layers_volume(cache_dir: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        if !cache_dir.join(LEASES_LOCK).exists() {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        gc_stale_leases(&leases_dir);
+        if count_leases(&leases_dir) == 0 {
+            force_detach_layers_volume(cache_dir);
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cache_dir;
+    }
+}
+
 /// Force-detach and clean up all leases for a cache directory.
 ///
 /// Used by `--force-extract` before clearing the cache. NOT used by normal
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
+///
 /// A named machine's volume is also shared by its fork children. Their pack
 /// symlinks pin it until the children are deleted, even if the source stops.
-/// Once those references are gone, stopping/deleting the source reclaims it.
+/// Once those references are gone, stopping/deleting the source reclaims it,
+/// and so does deleting the last child of a stopped source
+/// ([`release_unused_machine_layers_volume`]).
 pub fn force_detach_layers_volume(cache_dir: &Path) {
     // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
     // own the volume or the leases behind it, so detaching through the link
@@ -4516,9 +4547,10 @@ fn is_machine_layers_cache(cache_dir: &Path) -> bool {
 
 /// Fork children link their pack directory to the source (possibly through
 /// another child). Keep that immutable volume while any such reference exists.
-/// This deliberately includes stopped children: they may cold-start later, and
-/// a continuing source can stop/restart without invalidating their host handles.
-/// No PID lease or single overwriteable daemon owner can express that lifetime.
+/// Stopped children count too: liveness lives in machine records, which this
+/// crate cannot see, so a link is treated as a possible user. Deleting the last
+/// child of a stopped source releases the volume
+/// ([`release_unused_machine_layers_volume`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
     if !is_machine_layers_cache(cache_dir) {
@@ -8521,7 +8553,16 @@ mod orphan_reap_tests {
             "source"
         );
         fs::remove_file(&child).unwrap();
-        force_detach_layers_volume(&source);
+        // Deleting the last child releases a stopped source, unless a live
+        // process holds a lease because the source is mid-start.
+        drop(lock_leases(&source).unwrap());
+        fs::create_dir_all(source.join(LEASES_DIR)).unwrap();
+        let live_lease = source.join(LEASES_DIR).join(std::process::id().to_string());
+        fs::write(&live_lease, "").unwrap();
+        release_unused_machine_layers_volume(&source);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        fs::remove_file(&live_lease).unwrap();
+        release_unused_machine_layers_volume(&source);
         assert!(!is_mount_point(&source.join(CS_MOUNT_DIR)));
     }
 }
