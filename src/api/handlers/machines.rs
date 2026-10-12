@@ -3684,16 +3684,18 @@ pub async fn start_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(ApiError::database)?;
         let reason = if clones.is_empty() {
             "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                 .to_string()
         } else {
             format!(
-                "it is the fork base for {} live clone(s) ({}); delete the clones first",
+                "it is the frozen fork base for {} dependent clone(s) ({}); delete the clones first",
                 clones.len(),
                 clones.join(", ")
             )
@@ -5387,14 +5389,16 @@ pub async fn stop_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
-                "machine '{}' is the fork base of {} live clone(s) ({}); they CoW-map its \
-                 memory and disks — stop or delete the clones first",
+                "machine '{}' is the fork base of {} dependent clone(s) ({}); they CoW-map its \
+                 memory and disks — delete those clones first",
                 name,
                 clones.len(),
                 clones.join(", ")
