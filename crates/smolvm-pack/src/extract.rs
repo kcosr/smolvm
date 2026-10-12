@@ -4509,7 +4509,7 @@ fn detach_if_unused(cache_dir: &Path) {
 /// Named machines use `<vm-root>/<hash>/pack`; standalone packs use
 /// `<pack-root>/<checksum>`. Named volumes outlive the process that mounts them
 /// and are reclaimed by machine stop/delete, never by process-lease GC.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn is_machine_layers_cache(cache_dir: &Path) -> bool {
     cache_dir.file_name().is_some_and(|name| name == "pack")
 }
@@ -4519,7 +4519,7 @@ fn is_machine_layers_cache(cache_dir: &Path) -> bool {
 /// This deliberately includes stopped children: they may cold-start later, and
 /// a continuing source can stop/restart without invalidating their host handles.
 /// No PID lease or single overwriteable daemon owner can express that lifetime.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
     if !is_machine_layers_cache(cache_dir) {
         return Ok(false);
@@ -4572,7 +4572,7 @@ fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
 /// Standalone sibling caches that may hold a stranded process-owned volume.
 /// The start CLI's exit says nothing about a named VMM's liveness. In particular,
 /// walking `<vm-root>/<hash>/pack` peers would detach running sibling machines.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
     if is_machine_layers_cache(cache_dir) {
         return Vec::new();
