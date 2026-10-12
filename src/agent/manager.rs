@@ -3019,12 +3019,16 @@ impl AgentManager {
         // on disconnect — that's an SSH artifact, not present in a normal terminal
         // or under the `serve` supervisor.
         #[cfg(windows)]
-        {
+        let creation_flags = {
             use std::os::windows::process::CommandExt;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-        }
+            let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+            cmd.creation_flags(flags);
+            flags
+        };
+        #[cfg(not(windows))]
+        let creation_flags = 0;
         let child = cmd
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
@@ -3035,11 +3039,7 @@ impl AgentManager {
             &self.vsock_socket,
             &boot_exe,
             child_pid,
-            if cfg!(windows) {
-                0x0000_0008 | 0x0000_0200
-            } else {
-                0
-            },
+            creation_flags,
         );
         // Register the detached VM PID for the serve supervisor's selective
         // reaper. The boot subprocess owns its process group and is never
