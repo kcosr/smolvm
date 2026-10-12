@@ -5,6 +5,7 @@
 
 use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
+use crate::platform::endpoint_diagnostics as diagnostic;
 use crate::process::{self, ChildProcess};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
@@ -830,11 +831,35 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 /// std's unix-only `UnixListener`, so this builds on every host. Returns None on
 /// any error — readiness then falls back to the marker/ping.
 pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
-    let _ = std::fs::remove_file(path);
-    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
-    sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
-    sock.listen(16).ok()?;
-    sock.set_nonblocking(true).ok()?;
+    let _ = diagnostic::io(
+        "controller",
+        "ready.unlink",
+        path,
+        std::fs::remove_file(path),
+    );
+    let sock = diagnostic::io(
+        "controller",
+        "ready.socket",
+        path,
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None),
+    )
+    .ok()?;
+    let addr = diagnostic::io(
+        "controller",
+        "ready.address",
+        path,
+        socket2::SockAddr::unix(path),
+    )
+    .ok()?;
+    diagnostic::io("controller", "ready.bind", path, sock.bind(&addr)).ok()?;
+    diagnostic::io("controller", "ready.listen", path, sock.listen(16)).ok()?;
+    diagnostic::io(
+        "controller",
+        "ready.nonblocking",
+        path,
+        sock.set_nonblocking(true),
+    )
+    .ok()?;
     Some(sock)
 }
 
@@ -2192,8 +2217,19 @@ impl AgentManager {
         }
 
         // Clean up old socket and this VM's stale (per-VM) readiness marker.
-        let _ = std::fs::remove_file(&self.vsock_socket);
-        let _ = std::fs::remove_file(self.ready_marker_path());
+        let _ = diagnostic::io(
+            "controller",
+            "prepare.unlink_socket",
+            &self.vsock_socket,
+            std::fs::remove_file(&self.vsock_socket),
+        );
+        let ready_marker = self.ready_marker_path();
+        let _ = diagnostic::io(
+            "controller",
+            "prepare.unlink_marker",
+            &ready_marker,
+            std::fs::remove_file(&ready_marker),
+        );
         let _ = std::fs::remove_file(&self.startup_error_log);
 
         Ok(())
@@ -2994,6 +3030,17 @@ impl AgentManager {
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
 
         let child_pid = child.id() as i32;
+        diagnostic::launched(
+            self.name(),
+            &self.vsock_socket,
+            &boot_exe,
+            child_pid,
+            if cfg!(windows) {
+                0x0000_0008 | 0x0000_0200
+            } else {
+                0
+            },
+        );
         // Register the detached VM PID for the serve supervisor's selective
         // reaper. The boot subprocess owns its process group and is never
         // `wait()`ed, so it would zombie on exit; the supervisor tick reaps it.
@@ -3296,7 +3343,12 @@ impl AgentManager {
             &self.vsock_socket,
             &ready_marker,
         ] {
-            if let Err(e) = std::fs::remove_file(path) {
+            if let Err(e) = diagnostic::io(
+                "controller",
+                "cleanup.unlink",
+                path,
+                std::fs::remove_file(path),
+            ) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
                 }
@@ -3648,6 +3700,7 @@ impl AgentManager {
         }
 
         let ready_marker = self.ready_marker_path();
+        let mut diagnostics = diagnostic::Readiness::new(&self.vsock_socket);
         // PRIMARY readiness signal: the doorbell. libkrun connects to this socket
         // the instant the guest dials AGENT_READY at end-of-init, so `accept()`
         // returning IS readiness — event-driven, and needing no writable marker
@@ -3684,7 +3737,12 @@ impl AgentManager {
             // Primary: the readiness doorbell. Non-blocking accept polled at the
             // loop cadence; a connection means the guest reached end-of-init.
             if let Some(listener) = &ready_doorbell {
-                if listener.accept().is_ok() {
+                let accepted = listener.accept();
+                diagnostics.observe("doorbell.accept", &accepted);
+                let ready = accepted.is_ok();
+                drop(accepted);
+                if ready {
+                    diagnostics.outcome("doorbell");
                     tracing::debug!(
                         elapsed_ms = start.elapsed().as_millis(),
                         "agent ready (doorbell)"
@@ -3698,10 +3756,10 @@ impl AgentManager {
             // confined VMM pre-creates this file empty so Landlock can grant
             // write on just this one file (see internal_boot.rs) — so existence
             // alone would false-positive; require content.
-            if std::fs::metadata(&ready_marker)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-            {
+            let marker_metadata = std::fs::metadata(&ready_marker);
+            diagnostics.observe("marker.metadata", &marker_metadata);
+            if marker_metadata.map(|m| m.len() > 0).unwrap_or(false) {
+                diagnostics.outcome("marker");
                 let elapsed = start.elapsed();
                 tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
                 return Ok(());
@@ -3723,12 +3781,20 @@ impl AgentManager {
             // EACCES, so the marker can NEVER appear and every boot paid the
             // grace. The marker stays as a cheap fast path; it is no longer the
             // only signal.
-            if elapsed >= next_socket_probe && self.vsock_socket.exists() {
+            if elapsed >= next_socket_probe && {
+                let exists = self.vsock_socket.exists();
+                diagnostics.socket_exists(exists);
+                exists
+            } {
                 next_socket_probe = elapsed + SOCKET_PROBE_INTERVAL;
-                if let Ok(mut client) =
-                    super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
-                {
-                    if client.ping().is_ok() {
+                let connection =
+                    super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket);
+                diagnostics.observe("agent.connect", &connection);
+                if let Ok(mut client) = connection {
+                    let ping = client.ping();
+                    diagnostics.observe("agent.ping", &ping);
+                    if ping.is_ok() {
+                        diagnostics.outcome("ping");
                         // The agent answers, so readiness is real either way. Say
                         // WHY the marker lost, and only complain when it is a
                         // genuine fault rather than a benign race.
@@ -3762,6 +3828,7 @@ impl AgentManager {
             std::thread::sleep(Duration::from_millis(poll_ms));
         }
 
+        diagnostics.outcome("timeout");
         Err(Error::agent(
             "wait for ready",
             format!(

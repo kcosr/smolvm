@@ -632,6 +632,7 @@ pub const MEDIATED_IDENTITY_FILE: &str = "mediated-identity";
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+    use crate::platform::endpoint_diagnostics as diagnostic;
     let t0 = std::time::Instant::now();
 
     // Emit boot timing to stderr (captured in the startup error log by the
@@ -1741,11 +1742,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Add vsock port for control channel (critical - host-guest communication)
         let socket_path = try_or_free_ctx!(
-            path_to_cstring(vsock_socket),
+            path_to_cstring(vsock_socket).inspect_err(|e| diagnostic::failure(
+                "boot",
+                "agent.address",
+                vsock_socket,
+                e
+            )),
             "add vsock port",
             "path contains null byte"
         );
-        if krun_add_vsock_port2(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
+        let control_ret =
+            krun_add_vsock_port2(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true);
+        diagnostic::ffi(
+            "krun_add_vsock_port2",
+            vsock_socket,
+            Some(ports::AGENT_CONTROL),
+            Some(true),
+            control_ret,
+        );
+        if control_ret < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
                 "add vsock port",
@@ -1759,8 +1774,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // can't be added the boot still readies via the marker/ping fallbacks.
         {
             let ready_path = vsock_socket.with_extension("ready");
-            if let Ok(ready_c) = path_to_cstring(&ready_path) {
-                if krun_add_vsock_port2(ctx, ports::AGENT_READY, ready_c.as_ptr(), false) < 0 {
+            if let Ok(ready_c) = path_to_cstring(&ready_path)
+                .inspect_err(|e| diagnostic::failure("boot", "ready.address", &ready_path, e))
+            {
+                let ready_ret =
+                    krun_add_vsock_port2(ctx, ports::AGENT_READY, ready_c.as_ptr(), false);
+                diagnostic::ffi(
+                    "krun_add_vsock_port2",
+                    &ready_path,
+                    Some(ports::AGENT_READY),
+                    Some(false),
+                    ready_ret,
+                );
+                if ready_ret < 0 {
                     tracing::warn!(
                         "readiness-doorbell vsock port failed to add; using marker/ping"
                     );
@@ -1904,6 +1930,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 Some(set_control_socket) => match CString::new(ctl_str.clone()) {
                     Ok(ctl_c) => {
                         let ret = set_control_socket(ctx, ctl_c.as_ptr());
+                        diagnostic::ffi("krun_set_control_socket", ctl, None, None, ret);
                         if ret < 0 {
                             tracing::warn!("krun_set_control_socket failed: {ret}");
                         } else {
@@ -2489,6 +2516,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
         let start_error_detail = krun.last_error_message();
+        diagnostic::ffi("krun_start_enter", vsock_socket, None, None, ret);
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);

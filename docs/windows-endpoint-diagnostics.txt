@@ -1,0 +1,58 @@
+Windows endpoint diagnostic checkpoint
+
+Base: official smolvm v1.27.0, 06a45a223497b58c74c5c5e61d46b5aeaecf7f67.
+This branch adds opt-in host logging only. It does not contain the prepared-VM
+integration fixes or change Windows branching, readiness gates, retry deadlines,
+cleanup policy, process creation flags, guest assets or libkrun DLLs.
+
+Set SMOLVM_ENDPOINT_DIAGNOSTICS=1 in the invoking process to record at most
+64 distinct endpoint-operation events and 16 readiness summaries per process.
+Events use the smolvm::endpoint_diagnostics tracing target at warn level.
+They include PIDs, endpoint paths, I/O error kind/raw code, and exact libkrun
+return codes. A libkrun negative errno is not a captured WinSock last error.
+Readiness summaries retain counts and first/last error text, the winning signal
+or timeout, and a final read-only socket metadata/try_exists snapshot.
+Disabled diagnostics add no filesystem queries or result changes.
+
+For a separately authorized native reproduction, existing switches can capture
+the stock DLL's detailed bind/connect logs without rebuilding the guest or DLLs:
+  SMOLVM_BOOT_DEBUG=1
+  SMOLVM_KRUN_LOG_LEVEL=4
+  RUST_LOG=warn,smolvm::endpoint_diagnostics=warn,devices::virtio::vsock=debug
+RUST_LOG is also consumed by libkrun and can override its default log level.
+On Windows the detached boot child's output goes to its per-VM boot-debug.log.
+These switches do not repair stale endpoints or make cleanup safe.
+
+Ownership: the host controller binds agent.ready; libkrun in _boot-vm connects
+to it for guest port 6004. Libkrun binds agent.sock for port 6000. control.sock
+is a text file containing libkrun's loopback TCP control port on Windows.
+The guest's .smolvm-ready.<hash> is a separate ordinary marker file. Its
+ready_sent log does not confirm that the host received the doorbell.
+
+Native evidence from the isolated Windows 26200.9445 investigation:
+- Unmodified locked host build and instrumented locked host build passed with
+  Rust 1.99.0 (b940084d7 2026-09-28), x86_64-pc-windows-gnu, MinGW GCC 16.1.0.
+- Rust 1.92.0 stopped at checkpoint/store.rs:1271 on unstable atomic_try_update;
+  this was a compiler prerequisite, not a runtime defect. Toolchain/dependencies
+  were prepared in scratch without host-wide installation.
+- A standalone native socket2 0.6.4 parent/child control passed AF_UNIX doorbell,
+  agent byte exchange, TCP control and exact-file cleanup in scratch, both with
+  ordinary flags and DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP (0x208).
+- The same control at a unique owned directory under the normal smolvm/vms
+  parent failed without detachment: ready connect returned WinSock 10022;
+  both new AF_UNIX entries subsequently returned 1920 even when opened with
+  OPEN_REPARSE_POINT. Exact-file deletion after waiting for the helper child
+  also failed with HRESULT 0x80070780 (Win32 1920).
+- Testing stopped at that first failed location comparison. The profile-detached
+  case and a fresh VM reproduction were not run. There were no VM lifecycle
+  calls in this phase. The old failed VM and new standalone control were retained.
+
+This reproduces the endpoint failure without a VM or libkrun. It excludes
+detachment as a necessary condition in the tested context. It does not establish
+which filesystem/filter/launch-context interaction causes it, nor prove a fix.
+Do not remove the exists gate or redirect production state on this evidence alone.
+
+The native helper sources, per-case logs, ownership manifest, hashes and registry
+comparison are preserved at C:\codex-scratch\smolvm-wdiag-20261012.
+The original failed fixture/evidence remain under the earlier investigation.
+No upstream issue or PR is part of this checkpoint.

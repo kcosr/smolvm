@@ -2788,7 +2788,13 @@ fn remove_vm_data_and_record(
     data_dir: &std::path::Path,
 ) -> smolvm::Result<()> {
     if data_dir.exists() {
-        std::fs::remove_dir_all(data_dir).map_err(|e| {
+        smolvm::platform::endpoint_diagnostics::io(
+            "controller",
+            "cleanup.remove_dir_all",
+            data_dir,
+            std::fs::remove_dir_all(data_dir),
+        )
+        .map_err(|e| {
             smolvm::Error::storage(
                 "delete machine data",
                 format!("{}: {e}", data_dir.display()),

@@ -39,6 +39,9 @@ mod traits;
 
 pub mod uds;
 
+#[doc(hidden)]
+pub mod endpoint_diagnostics;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 

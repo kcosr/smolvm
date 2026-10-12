@@ -12,6 +12,7 @@
 //! the raw fd is exposed for the interactive-terminal `poll()` loop; that loop
 //! is itself Unix-only.
 
+use super::endpoint_diagnostics as diagnostic;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -27,17 +28,34 @@ pub struct UdsStream {
 impl UdsStream {
     /// Connect to the AF_UNIX socket at `path`.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
-        let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        sock.connect(&addr)?;
+        let path = path.as_ref();
+        let addr = diagnostic::io("uds_client", "address", path, SockAddr::unix(path))?;
+        let sock = diagnostic::io(
+            "uds_client",
+            "socket",
+            path,
+            Socket::new(Domain::UNIX, Type::STREAM, None),
+        )?;
+        diagnostic::io("uds_client", "connect", path, sock.connect(&addr))?;
         Ok(Self { inner: sock })
     }
 
     /// Connect with a deadline, including a full listener backlog.
     pub fn connect_timeout(path: impl AsRef<Path>, timeout: Duration) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
-        let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        sock.connect_timeout(&addr, timeout)?;
+        let path = path.as_ref();
+        let addr = diagnostic::io("uds_client", "address", path, SockAddr::unix(path))?;
+        let sock = diagnostic::io(
+            "uds_client",
+            "socket",
+            path,
+            Socket::new(Domain::UNIX, Type::STREAM, None),
+        )?;
+        diagnostic::io(
+            "uds_client",
+            "connect_timeout",
+            path,
+            sock.connect_timeout(&addr, timeout),
+        )?;
         Ok(Self { inner: sock })
     }
 
@@ -172,10 +190,16 @@ impl UdsListener {
     /// The caller is responsible for removing any stale socket file first
     /// (matching `UnixListener::bind` semantics, which also fail on EADDRINUSE).
     pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
-        let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        sock.bind(&addr)?;
-        sock.listen(128)?;
+        let path = path.as_ref();
+        let addr = diagnostic::io("uds_listener", "address", path, SockAddr::unix(path))?;
+        let sock = diagnostic::io(
+            "uds_listener",
+            "socket",
+            path,
+            Socket::new(Domain::UNIX, Type::STREAM, None),
+        )?;
+        diagnostic::io("uds_listener", "bind", path, sock.bind(&addr))?;
+        diagnostic::io("uds_listener", "listen", path, sock.listen(128))?;
         Ok(Self { inner: sock })
     }
 
