@@ -536,11 +536,11 @@ impl LaunchFeatures {
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
         self.packed_layers_dir = Some(layers_lease.path.clone());
         // Leak the lease so the case-sensitive layers volume stays mounted for
-        // the VM's lifetime (macOS only; a no-op on Linux). Unlike the previous
-        // shared-cache design, this volume is owned 1:1 by the machine: the stop
-        // and delete handlers detach it unconditionally via
-        // `force_detach_layers_volume`, so no co-tenant can be relying on it and
-        // no lease outlives the machine.
+        // the VM's lifetime (macOS only; a no-op on Linux). Named-machine caches
+        // are excluded from process-lease orphan sweeping: this CLI can exit
+        // while the VMM remains alive. Stop/delete reclaim the volume via
+        // `force_detach_layers_volume`, which also preserves a source volume
+        // while fork children still reference it through their pack symlinks.
         std::mem::forget(layers_lease);
 
         Ok(self)
