@@ -3695,7 +3695,7 @@ pub async fn start_machine(
                 .to_string()
         } else {
             format!(
-                "it is the frozen fork base for {} dependent clone(s) ({}); delete the clones first",
+                "it is the fork base for {} dependent clone(s) ({}); delete the clones first",
                 clones.len(),
                 clones.join(", ")
             )

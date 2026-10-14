@@ -1705,7 +1705,7 @@ fn start_vm_named_with_db(
                     .to_string()
             } else {
                 format!(
-                    "it is the frozen branch source for {} dependent child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
+                    "it is the branch source for {} dependent child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
                     clones.len(),
                     clones.join(", ")
                 )
